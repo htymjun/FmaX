@@ -1,7 +1,7 @@
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ! CUDA Fortran Implementation of fltflt
 !
-! Copyright (c) 2026, htymjun
+! Copyright (c) 2026, Jun Hatayama
 ! This is a Fortran translation/derivative work of the original C++ fltflt.h.
 !
 ! Original C++ implementation:
@@ -172,10 +172,39 @@ module fltflt
   public :: fltflt_shfl_down, fltflt_shfl_xor
   public :: fltflt_add3, fltflt_add4, fltflt_add5
   public :: fltflt_square, fltflt_recip
-  public :: fltflt_dot2, fltflt_dot3
+  ! fltflt_dot2/3/4: compensated dot products. 3 overloads each (r4 / r8 / fltflt).
+  interface fltflt_dot2
+    module procedure dot2_r4, dot2_r8, dot2_ff
+  end interface fltflt_dot2
+  public :: fltflt_dot2
+
+  interface fltflt_dot3
+    module procedure dot3_r4, dot3_r8, dot3_ff
+  end interface fltflt_dot3
+  public :: fltflt_dot3
+
+  interface fltflt_dot4
+    module procedure dot4_r4, dot4_r8, dot4_ff
+  end interface fltflt_dot4
+  public :: fltflt_dot4
   public :: fltflt_abs, fltflt_sqrt, fltflt_sqrt_fast
   public :: fltflt_norm3d
   public :: fltflt_round_to_nearest, fltflt_round_toward_zero, fltflt_floor
+  ! fltflt_min / fltflt_max: branchless on GPU (predicated select). 3 overloads each.
+  interface fltflt_min
+    module procedure fltflt_min_ff_ff, fltflt_min_ff_r4, fltflt_min_r4_ff
+  end interface fltflt_min
+  public :: fltflt_min
+
+  interface fltflt_max
+    module procedure fltflt_max_ff_ff, fltflt_max_ff_r4, fltflt_max_r4_ff
+  end interface fltflt_max
+  public :: fltflt_max
+
+  public :: fltflt_clamp, fltflt_ceil, fltflt_hypot
+  public :: fltflt_cross3d
+  public :: fltflt_pow_int, fltflt_sign, fltflt_lerp
+  public :: fltflt_warp_reduce_sum
 
 contains
 
@@ -856,18 +885,44 @@ contains
   ! yields a result faithful to the true dot product.
   ! ================================================================
 
-  ! fltflt_dot2: a*b + c*d. ~8 flops + 2 FMAs.
-  pure attributes(device) function fltflt_dot2(a, b, c, d) result(r)
+  ! ---- dot2: a*b + c*d ----
+
+  ! dot2_r4: real(4) inputs. ~8 flops + 2 FMAs.
+  pure attributes(device) function dot2_r4(a, b, c, d) result(r)
     real(4), intent(in) :: a, b, c, d
     type(fltflt) :: r, p1, p2, s
     p1 = fltflt_two_prod_fma(a, b)
     p2 = fltflt_two_prod_fma(c, d)
     s  = fltflt_two_sum(p1%hi, p2%hi)
     r  = fltflt_fast_two_sum(s%hi, s%lo + p1%lo + p2%lo)
-  end function fltflt_dot2
+  end function dot2_r4
 
-  ! fltflt_dot3: a*b + c*d + e*f. ~13 flops + 3 FMAs.
-  pure attributes(device) function fltflt_dot3(a, b, c, d, e, f) result(r)
+  ! dot2_r8: real(8) inputs — each converted to fltflt, then delegates to dot2_ff.
+  pure attributes(device) function dot2_r8(a, b, c, d) result(r)
+    real(8), intent(in) :: a, b, c, d
+    type(fltflt) :: r
+    r = dot2_ff(init_from_r8(a), init_from_r8(b), init_from_r8(c), init_from_r8(d))
+  end function dot2_r8
+
+  ! dot2_ff: fltflt inputs. TwoProd(hi,hi) + 2 cross FMAs per product. ~12 flops + 6 FMAs.
+  ! a%lo*b%lo is omitted — beyond ~48-bit budget, same convention as mul_ff_ff.
+  pure attributes(device) function dot2_ff(a, b, c, d) result(r)
+    type(fltflt), intent(in) :: a, b, c, d
+    type(fltflt) :: r, p1, p2, s
+    p1    = fltflt_two_prod_fma(a%hi, b%hi)
+    p2    = fltflt_two_prod_fma(c%hi, d%hi)
+    p1%lo = __fmaf_rn(a%hi, b%lo, p1%lo)
+    p1%lo = __fmaf_rn(a%lo, b%hi, p1%lo)
+    p2%lo = __fmaf_rn(c%hi, d%lo, p2%lo)
+    p2%lo = __fmaf_rn(c%lo, d%hi, p2%lo)
+    s     = fltflt_two_sum(p1%hi, p2%hi)
+    r     = fltflt_fast_two_sum(s%hi, s%lo + p1%lo + p2%lo)
+  end function dot2_ff
+
+  ! ---- dot3: a*b + c*d + e*f ----
+
+  ! dot3_r4: real(4) inputs. ~13 flops + 3 FMAs.
+  pure attributes(device) function dot3_r4(a, b, c, d, e, f) result(r)
     real(4), intent(in) :: a, b, c, d, e, f
     type(fltflt) :: r, p1, p2, p3, s1, s2
     real(4) :: lo
@@ -878,7 +933,85 @@ contains
     s2 = fltflt_two_sum(s1%hi, p3%hi)
     lo = (s1%lo + s2%lo) + (p1%lo + p2%lo + p3%lo)
     r  = fltflt_fast_two_sum(s2%hi, lo)
-  end function fltflt_dot3
+  end function dot3_r4
+
+  ! dot3_r8: real(8) inputs.
+  pure attributes(device) function dot3_r8(a, b, c, d, e, f) result(r)
+    real(8), intent(in) :: a, b, c, d, e, f
+    type(fltflt) :: r
+    r = dot3_ff(init_from_r8(a), init_from_r8(b), init_from_r8(c), &
+                init_from_r8(d), init_from_r8(e), init_from_r8(f))
+  end function dot3_r8
+
+  ! dot3_ff: fltflt inputs. ~19 flops + 9 FMAs.
+  pure attributes(device) function dot3_ff(a, b, c, d, e, f) result(r)
+    type(fltflt), intent(in) :: a, b, c, d, e, f
+    type(fltflt) :: r, p1, p2, p3, s1, s2
+    real(4) :: lo
+    p1    = fltflt_two_prod_fma(a%hi, b%hi)
+    p2    = fltflt_two_prod_fma(c%hi, d%hi)
+    p3    = fltflt_two_prod_fma(e%hi, f%hi)
+    p1%lo = __fmaf_rn(a%hi, b%lo, p1%lo)
+    p1%lo = __fmaf_rn(a%lo, b%hi, p1%lo)
+    p2%lo = __fmaf_rn(c%hi, d%lo, p2%lo)
+    p2%lo = __fmaf_rn(c%lo, d%hi, p2%lo)
+    p3%lo = __fmaf_rn(e%hi, f%lo, p3%lo)
+    p3%lo = __fmaf_rn(e%lo, f%hi, p3%lo)
+    s1    = fltflt_two_sum(p1%hi, p2%hi)
+    s2    = fltflt_two_sum(s1%hi, p3%hi)
+    lo    = (s1%lo + s2%lo) + (p1%lo + p2%lo + p3%lo)
+    r     = fltflt_fast_two_sum(s2%hi, lo)
+  end function dot3_ff
+
+  ! ---- dot4: a*b + c*d + e*f + g*h ----
+
+  ! dot4_r4: real(4) inputs. ~23 flops + 4 FMAs.
+  pure attributes(device) function dot4_r4(a, b, c, d, e, f, g, h) result(r)
+    real(4), intent(in) :: a, b, c, d, e, f, g, h
+    type(fltflt) :: r, p1, p2, p3, p4, s1, s2, s3
+    real(4) :: lo
+    p1 = fltflt_two_prod_fma(a, b)
+    p2 = fltflt_two_prod_fma(c, d)
+    p3 = fltflt_two_prod_fma(e, f)
+    p4 = fltflt_two_prod_fma(g, h)
+    s1 = fltflt_two_sum(p1%hi, p2%hi)
+    s2 = fltflt_two_sum(s1%hi, p3%hi)
+    s3 = fltflt_two_sum(s2%hi, p4%hi)
+    lo = ((s1%lo + s2%lo) + s3%lo) + (p1%lo + p2%lo + p3%lo + p4%lo)
+    r  = fltflt_fast_two_sum(s3%hi, lo)
+  end function dot4_r4
+
+  ! dot4_r8: real(8) inputs.
+  pure attributes(device) function dot4_r8(a, b, c, d, e, f, g, h) result(r)
+    real(8), intent(in) :: a, b, c, d, e, f, g, h
+    type(fltflt) :: r
+    r = dot4_ff(init_from_r8(a), init_from_r8(b), init_from_r8(c), init_from_r8(d), &
+                init_from_r8(e), init_from_r8(f), init_from_r8(g), init_from_r8(h))
+  end function dot4_r8
+
+  ! dot4_ff: fltflt inputs. ~26 flops + 12 FMAs.
+  pure attributes(device) function dot4_ff(a, b, c, d, e, f, g, h) result(r)
+    type(fltflt), intent(in) :: a, b, c, d, e, f, g, h
+    type(fltflt) :: r, p1, p2, p3, p4, s1, s2, s3
+    real(4) :: lo
+    p1    = fltflt_two_prod_fma(a%hi, b%hi)
+    p2    = fltflt_two_prod_fma(c%hi, d%hi)
+    p3    = fltflt_two_prod_fma(e%hi, f%hi)
+    p4    = fltflt_two_prod_fma(g%hi, h%hi)
+    p1%lo = __fmaf_rn(a%hi, b%lo, p1%lo)
+    p1%lo = __fmaf_rn(a%lo, b%hi, p1%lo)
+    p2%lo = __fmaf_rn(c%hi, d%lo, p2%lo)
+    p2%lo = __fmaf_rn(c%lo, d%hi, p2%lo)
+    p3%lo = __fmaf_rn(e%hi, f%lo, p3%lo)
+    p3%lo = __fmaf_rn(e%lo, f%hi, p3%lo)
+    p4%lo = __fmaf_rn(g%hi, h%lo, p4%lo)
+    p4%lo = __fmaf_rn(g%lo, h%hi, p4%lo)
+    s1    = fltflt_two_sum(p1%hi, p2%hi)
+    s2    = fltflt_two_sum(s1%hi, p3%hi)
+    s3    = fltflt_two_sum(s2%hi, p4%hi)
+    lo    = ((s1%lo + s2%lo) + s3%lo) + (p1%lo + p2%lo + p3%lo + p4%lo)
+    r     = fltflt_fast_two_sum(s3%hi, lo)
+  end function dot4_ff
 
   ! ================================================================
   ! Absolute value
@@ -1118,5 +1251,152 @@ contains
     c%hi = sgn * rem%hi
     c%lo = sgn * rem%lo
   end function fmod_ff_r4
+
+  ! ================================================================
+  ! min / max / clamp
+  ! ================================================================
+
+  pure attributes(device) function fltflt_min_ff_ff(a, b) result(r)
+    type(fltflt), intent(in) :: a, b
+    type(fltflt) :: r
+    if (a <= b) then;  r = a;  else;  r = b;  end if
+  end function fltflt_min_ff_ff
+
+  pure attributes(device) function fltflt_min_ff_r4(a, b) result(r)
+    type(fltflt), intent(in) :: a
+    real(4),      intent(in) :: b
+    type(fltflt) :: r, bf
+    bf = init_from_r4(b)
+    if (a <= bf) then;  r = a;  else;  r = bf;  end if
+  end function fltflt_min_ff_r4
+
+  pure attributes(device) function fltflt_min_r4_ff(a, b) result(r)
+    real(4),      intent(in) :: a
+    type(fltflt), intent(in) :: b
+    type(fltflt) :: r, af
+    af = init_from_r4(a)
+    if (af <= b) then;  r = af;  else;  r = b;  end if
+  end function fltflt_min_r4_ff
+
+  pure attributes(device) function fltflt_max_ff_ff(a, b) result(r)
+    type(fltflt), intent(in) :: a, b
+    type(fltflt) :: r
+    if (a >= b) then;  r = a;  else;  r = b;  end if
+  end function fltflt_max_ff_ff
+
+  pure attributes(device) function fltflt_max_ff_r4(a, b) result(r)
+    type(fltflt), intent(in) :: a
+    real(4),      intent(in) :: b
+    type(fltflt) :: r, bf
+    bf = init_from_r4(b)
+    if (a >= bf) then;  r = a;  else;  r = bf;  end if
+  end function fltflt_max_ff_r4
+
+  pure attributes(device) function fltflt_max_r4_ff(a, b) result(r)
+    real(4),      intent(in) :: a
+    type(fltflt), intent(in) :: b
+    type(fltflt) :: r, af
+    af = init_from_r4(a)
+    if (af >= b) then;  r = af;  else;  r = b;  end if
+  end function fltflt_max_r4_ff
+
+  ! fltflt_clamp: clamp a to [lo, hi].
+  pure attributes(device) function fltflt_clamp(a, lo, hi) result(r)
+    type(fltflt), intent(in) :: a, lo, hi
+    type(fltflt) :: r
+    r = fltflt_min_ff_ff(fltflt_max_ff_ff(a, lo), hi)
+  end function fltflt_clamp
+
+  ! ================================================================
+  ! ceil
+  ! ================================================================
+
+  ! fltflt_ceil: smallest integer not less than a. Uses identity ceil(x) = -floor(-x).
+  pure attributes(device) function fltflt_ceil(a) result(c)
+    type(fltflt), intent(in) :: a
+    type(fltflt) :: c, neg
+    neg%hi = -a%hi
+    neg%lo = -a%lo
+    c = fltflt_floor(neg)
+    c%hi = -c%hi
+    c%lo = -c%lo
+  end function fltflt_ceil
+
+  ! ================================================================
+  ! hypot
+  ! ================================================================
+
+  ! fltflt_hypot: sqrt(a^2 + b^2) for real(4) inputs. Uses exact dot2 for the sum of squares.
+  pure attributes(device) function fltflt_hypot(a, b) result(c)
+    real(4), intent(in) :: a, b
+    type(fltflt) :: c
+    c = fltflt_sqrt(fltflt_dot2(a, a, b, b))
+  end function fltflt_hypot
+
+  ! ================================================================
+  ! cross product
+  ! ================================================================
+
+  ! fltflt_cross3d: a x b = (ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx).
+  ! Uses fltflt_dot2 for exact cancellation in each component. 3 x (8 flops + 2 FMAs).
+  attributes(device) subroutine fltflt_cross3d(cx, cy, cz, ax, ay, az, bx, by, bz)
+    type(fltflt), intent(out) :: cx, cy, cz
+    real(4),      intent(in)  :: ax, ay, az, bx, by, bz
+    cx = fltflt_dot2( ay, bz, -az, by)
+    cy = fltflt_dot2( az, bx, -ax, bz)
+    cz = fltflt_dot2( ax, by, -ay, bx)
+  end subroutine fltflt_cross3d
+
+  ! ================================================================
+  ! integer power, sign, lerp, warp reduction
+  ! ================================================================
+
+  ! fltflt_pow_int: a^n for non-negative integer n via square-and-multiply.
+  attributes(device) function fltflt_pow_int(a, n) result(r)
+    type(fltflt), intent(in) :: a
+    integer,      intent(in) :: n
+    type(fltflt) :: r, base
+    integer :: m
+    r%hi = 1.0;  r%lo = 0.0
+    base = a;    m = n
+    do while (m > 0)
+      if (mod(m, 2) == 1) r = r * base
+      base = fltflt_square(base)
+      m = m / 2
+    end do
+  end function fltflt_pow_int
+
+  ! fltflt_sign: copysign — magnitude of a with sign of b.
+  pure attributes(device) function fltflt_sign(a, b) result(c)
+    type(fltflt), intent(in) :: a, b
+    type(fltflt) :: c, abs_a
+    real(4) :: s
+    abs_a = fltflt_abs(a)
+    s     = sign(1.0, b%hi)
+    c%hi  = abs_a%hi * s
+    c%lo  = abs_a%lo * s
+  end function fltflt_sign
+
+  ! fltflt_lerp: linear interpolation a + t*(b-a) for real(4) t in [0,1].
+  pure attributes(device) function fltflt_lerp(a, b, t) result(c)
+    type(fltflt), intent(in) :: a, b
+    real(4),      intent(in) :: t
+    type(fltflt) :: c
+    c = a + t * (b - a)
+  end function fltflt_lerp
+
+  ! fltflt_warp_reduce_sum: XOR-butterfly all-reduce across 32 lanes.
+  ! After the call every lane holds the sum of all 32 input values.
+  attributes(device) function fltflt_warp_reduce_sum(val) result(r)
+    type(fltflt), intent(in) :: val
+    type(fltflt) :: r
+    integer :: mask
+    r    = val
+    mask = 16
+    do while (mask > 0)
+      r    = r + fltflt_shfl_xor(r, mask)
+      mask = mask / 2
+    end do
+  end function fltflt_warp_reduce_sum
 
 end module fltflt

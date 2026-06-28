@@ -11,7 +11,7 @@ OUxMIX implements **float-float (FF) precision arithmetic** for CUDA Fortran. Th
 ```bash
 # Full test suite (from ouxmix/)
 cmake -B build && cmake --build build -j
-cd build && ./test_add && ./test_sub && ./test_mul && ./test_div && ./test_dot && ./test_bench
+cd build && ./test_add && ./test_sub && ./test_mul && ./test_div && ./test_dot && ./test_bench && ./test_extra
 
 # Generate accuracy + throughput plot (output: test/ffp_results.png)
 cmake --build build --target plot
@@ -76,16 +76,25 @@ Public API (all `pure attributes(device)` unless noted):
 - `fltflt_recip(a)` — `1/a` via Newton step
 - `fltflt_dot2(a,b,c,d)` — exact `a*b + c*d`
 - `fltflt_dot3(a,b,c,d,e,f)` — exact `a*b + c*d + e*f`
+- `fltflt_dot4(a,b,c,d,e,f,g,h)` — exact 4-pair dot product
 - `fltflt_abs(a)` — branchless absolute value
 - `fltflt_sqrt(a)` — Newton-step square root
 - `fltflt_sqrt_fast(a)` — ~7-flop rsqrt-based square root
 - `fltflt_norm3d(dx,dy,dz)` — `sqrt(dx^2 + dy^2 + dz^2)`
-- `fltflt_round_to_nearest(a)`, `fltflt_round_toward_zero(a)`, `fltflt_floor(a)` — rounding
+- `fltflt_hypot(a,b)` — `sqrt(a^2 + b^2)` for `real(4)` inputs via exact dot2
+- `fltflt_round_to_nearest(a)`, `fltflt_round_toward_zero(a)`, `fltflt_floor(a)`, `fltflt_ceil(a)` — rounding
+- `fltflt_min(a,b)`, `fltflt_max(a,b)` — min/max; 3 overloads each (ff/ff, ff/r4, r4/ff)
+- `fltflt_clamp(a,lo,hi)` — clamp to [lo,hi]
+- `fltflt_sign(a,b)` — copysign: magnitude of a with sign of b
+- `fltflt_lerp(a,b,t)` — linear interpolation `a + t*(b-a)`, `t :: real(4)`
+- `fltflt_pow_int(a,n)` — `a^n` for non-negative integer n; not `pure`
+- `fltflt_cross3d(cx,cy,cz, ax,ay,az, bx,by,bz)` — 3D cross product (subroutine); uses dot2 for exact cancellation
 - `fltflt_shfl_down(a,delta)`, `fltflt_shfl_xor(a,mask)` — warp shuffles for `fltflt`
+- `fltflt_warp_reduce_sum(val)` — XOR-butterfly all-reduce across 32 lanes; not `pure`
 
 ### test/
 
-Six programs (one per operation domain), each containing a `module test_*_kern` with CUDA `attributes(global)` kernels and a `program test_*` with accuracy cases and a benchmark. All write CSV results to `test/`.
+Programs (one per operation domain), each containing a `module test_*_kern` with CUDA `attributes(global)` kernels and a `program test_*` with accuracy cases and a benchmark. All write CSV results to `test/`.
 
 ## Key Constraints
 
