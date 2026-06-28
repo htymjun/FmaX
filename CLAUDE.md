@@ -11,14 +11,14 @@ OUxMIX implements **float-float (FF) precision arithmetic** for CUDA Fortran. Th
 ```bash
 # Full test suite (from ouxmix/)
 cmake -B build && cmake --build build -j
-cd build && ./a.out
+cd build && ./test_add && ./test_sub && ./test_mul && ./test_div && ./test_dot && ./test_bench
 
 # Generate accuracy + throughput plot (output: test/ffp_results.png)
 cmake --build build --target plot
 
 # Individual tutorials (from tutorial/)
 cmake -B build && cmake --build build -j
-cd build && ./tut_add && ./tut_sub && ./tut_mul && ./tut_div
+cd build && ./tut_add && ./tut_sub && ./tut_mul && ./tut_div && ./tut_dot3
 
 # Override GPU compute capability (default: 89 for RTX 4060)
 cmake -B build -DCASE_GPU_CC=86
@@ -31,47 +31,74 @@ The compiler is `nvfortran` (set via `CMAKE_Fortran_COMPILER`; falls back to `mp
 ```
 OUxMIX/
   ouxmix/
-    mod_ffp_eft.f90  — fltflt type + EFT backend (two_sum, fast_two_sum, two_prod)
-    mod_ffp.f90      — public API (init, operators, warp shuffles); uses mod_ffp_eft
-    CMakeLists.txt   — Build config; defines a `plot` custom target
+    fltflt.f90       — single source: fltflt type + EFT primitives + public API
+    CMakeLists.txt   — builds 6 test executables + plot target
     build/           — CMake build directory (gitignored)
   test/
-    test_ffp.f90     — exhaustive accuracy + benchmark tests; writes ffp_results.csv
+    test_add.f90     — addition accuracy + benchmark (r4, r8, fltflt)
+    test_sub.f90     — subtraction accuracy + benchmark
+    test_mul.f90     — multiplication accuracy + benchmark
+    test_div.f90     — division accuracy + benchmark
+    test_dot.f90     — compensated dot2/dot3 accuracy + benchmark
+    test_bench.f90   — head-to-head r4 vs r8 vs fltflt throughput; writes ffp_results.csv
     plot_ffp.py      — reads ffp_results.csv, writes ffp_results.png
-    ffp_results.csv  — latest benchmark output
-    ffp_results.png  — latest plot
   tutorial/
-    CMakeLists.txt   — builds four executables (tut_add, tut_sub, tut_mul, tut_div)
-    tut_add.f90      — addition:       1e8 + 1, shows exact lo component
-    tut_sub.f90      — subtraction:    (1+2^-25) - 1, below real(4) epsilon
+    CMakeLists.txt   — builds 9 executables
+    tut_add.f90      — addition: 1e8 + 1
+    tut_sub.f90      — subtraction: (1+2^-25) - 1, below real(4) epsilon
     tut_mul.f90      — multiplication: 1.1 * 1.1, FMA-based TwoProd
-    tut_div.f90      — division:       1/3, Dekker one-Newton-step refinement
+    tut_div.f90      — division: 1/3, Newton-step refinement
+    tut_add_r8.f90   — real(8)-input addition
+    tut_sub_r8.f90   — real(8)-input subtraction
+    tut_mul_r8.f90   — real(8)-input multiplication
+    tut_div_r8.f90   — real(8)-input division
+    tut_dot3.f90     — compensated dot product: a*b + c*d + e*f
 ```
 
-### ouxmix/mod_ffp_eft.f90 (backend)
+### ouxmix/fltflt.f90
 
-Defines `fltflt` and the three EFT primitives used internally by `mod_ffp`:
-- `two_sum` — exact sum, 6 flops, no precondition
-- `fast_two_sum` — exact sum, 3 flops, requires `|a| >= |b|`
-- `two_prod` — exact product: `hi = a*b`, `lo = fma(a, b, -hi)` (1 MUL + 1 FMAF.F32)
+Single module `fltflt`. Private EFT primitives (always inlined, never in public API):
+- `fltflt_two_sum` — exact sum, 6 flops, no precondition
+- `fltflt_fast_two_sum` — exact sum, 3 flops, requires `|a| >= |b|`
+- `fltflt_two_prod_fma` — exact product: `hi = a*b`, `lo = __fmaf_rn(a,b,-hi)` (1 MUL + 1 FMAF.F32)
 
-### ouxmix/mod_ffp.f90 (public API)
-
-Does `use mod_ffp_eft, only: fltflt, two_sum, fast_two_sum, two_prod` and exports:
+Public API (all `pure attributes(device)` unless noted):
 - `fltflt` — the `(hi, lo)` type
-- `init(a)` — constructor from `real(4)` or `real(8)` (both device and host)
-- Overloaded `+`, `-`, `*`, `/` for all combinations of `fltflt` and `real(4)`
-- `shfl_down_ff`, `shfl_xor_ff` — warp shuffle for `fltflt` (wraps `__shfl_down`/`__shfl_xor`)
+- `fltflt_init(a)` — constructor from `real(4)` or `real(8)` (`attributes(device,host)`)
+- `+`, `-`, `*`, `/` — operators for all combinations of `fltflt`, `real(4)`, `real(8)`
+- `==`, `/=`, `<`, `>`, `<=`, `>=` — comparison operators (lexicographic on hi then lo)
+- `fltflt_add_same_sign(a,b)` — 11-flop add, valid only when `sign(a) == sign(b)`
+- `fltflt_fma(a,b,c)` — fused multiply-add `a*b+c`; 7 overloads (ff/r4 combinations)
+- `fltflt_fma_approx(a,b,c)` — like `fltflt_fma` but skips `a%lo*b%lo`; 7 overloads
+- `fltflt_fmod(a,b)` — modulo, 2 overloads (ff/ff, ff/r4); not `pure` (uses `do while`)
+- `fltflt_add3(a,b,c)`, `fltflt_add4`, `fltflt_add5` — multi-operand exact add
+- `fltflt_square(a)` — `a*a` using symmetric TwoProd
+- `fltflt_recip(a)` — `1/a` via Newton step
+- `fltflt_dot2(a,b,c,d)` — exact `a*b + c*d`
+- `fltflt_dot3(a,b,c,d,e,f)` — exact `a*b + c*d + e*f`
+- `fltflt_abs(a)` — branchless absolute value
+- `fltflt_sqrt(a)` — Newton-step square root
+- `fltflt_sqrt_fast(a)` — ~7-flop rsqrt-based square root
+- `fltflt_norm3d(dx,dy,dz)` — `sqrt(dx^2 + dy^2 + dz^2)`
+- `fltflt_round_to_nearest(a)`, `fltflt_round_toward_zero(a)`, `fltflt_floor(a)` — rounding
+- `fltflt_shfl_down(a,delta)`, `fltflt_shfl_xor(a,mask)` — warp shuffles for `fltflt`
 
-### test/test_ffp.f90
+### test/
 
-Contains two modules: `test_kernels` (CUDA `attributes(global)` kernels) and the `test_ffp` program. The program writes results to `ffp_results.csv` and calls:
-- `run_accuracy_tests()` — scalar ff+ff, mixed ff+r4, and dot-product tests
-- `run_benchmark()` — times `real(8)` vs `fltflt` on a chained MAD loop over 2²⁰ elements
+Six programs (one per operation domain), each containing a `module test_*_kern` with CUDA `attributes(global)` kernels and a `program test_*` with accuracy cases and a benchmark. All write CSV results to `test/`.
 
 ## Key Constraints
 
-- **No default initializers on `fltflt`**: nvfortran crashes when compiling device code for types with default-initialized components. Always use `init()` or set `%hi` and `%lo` explicitly before use.
-- **`two_prod` requires hardware FMA**: the `-fast` flag (enables `-Mfma`) is mandatory; without it `fma(a,b,-hi)` degenerates and `two_prod` breaks silently.
+- **No default initializers on `fltflt`**: nvfortran crashes when compiling device code for types with default-initialized components. Always use `fltflt_init()` or set `%hi` and `%lo` explicitly before use.
+
+- **Hardware FMA via `__fmaf_rn`**: The Fortran 2023 `fma()` intrinsic triggers error 1253 in device code on nvfortran 24.7 (resolves as host C lib). A naive wrapper `ff_fma(a,b,c)=a*b+c` silently breaks `fltflt_two_prod_fma`: the GPU optimizer CSE-folds `a*b+(−a*b)=0` before `-Mfma` contraction runs, making `lo=0` and destroying accuracy. Solution: use `__fmaf_rn(a,b,c)` from `use cudadevice` directly — it is an opaque intrinsic that maps to hardware FMAF.F32 and cannot be simplified by the optimizer. Generates W-0473 warning when used inside `pure` functions; compile succeeds and works correctly. The `-fast` flag (enables `-Mfma`) is still required.
+
 - **Warp shuffles use nvfortran 25.x API**: `__shfl_down`/`__shfl_xor` (mask-implicit form). Older nvfortran versions may need `__shfl_down_sync`.
-- **EFT inlining is required for GPU performance**: `two_sum`, `fast_two_sum`, `two_prod`, `shfl_down_ff`, `shfl_xor_ff` must appear in the `-Minline=name:...` list in `CMakeLists.txt`.
+
+- **EFT inlining required for GPU performance**: `fltflt_two_sum`, `fltflt_fast_two_sum`, `fltflt_two_prod_fma`, and all major named functions must appear in `-Minline=name:...` in `CMakeLists.txt`. Without inlining, the Fortran-level inliner refuses derived-type returns ("return type doesn't match"), but the GPU backend inliner handles it at link time via `-gpu=lto`.
+
+- **Kernel module `private`**: Any module that does `use cudafor` (or `use fltflt`) and is itself used by a program that also does `use cudafor` must declare `private` with explicit `public` for its kernel names. Without `private`, the module re-exports all cudafor generic interfaces, causing nvfortran 24.7 to fail resolving `cudaEventRecord`/`cudaEventDestroy` in internal subroutines with "Could not resolve generic procedure".
+
+- **cudaEventRecord stream argument**: Requires `integer(8)` (e.g. `0_8`), not default `integer`. Default int triggers "Could not resolve generic procedure" in nvfortran 24.7.
+
+- **`.not.` operator broken on logical in device code**: In nvfortran, `.true.` is represented as the integer `+1` (not `-1` as in many Fortran implementations). Bitwise `.not.(+1)` = `0xFFFFFFFE` = `-2`, which is non-zero and therefore "true" in CUDA. Consequence: `.not. .true.` evaluates to "true" instead of "false". Affected functions: any `/=` implementation written as `.not. (==)`. Fix: implement `ne` directly using `/=` combined with `.or.`, never via `.not. eq_*()`. This is why `ne_ff_ff`, `ne_ff_r4`, and `ne_r4_ff` in `fltflt.f90` avoid `.not.`.

@@ -10,7 +10,7 @@
 
 module tut_sub_r8_kern
   use cudafor
-  use mod_ffp
+  use fltflt
   implicit none
 contains
 
@@ -19,7 +19,7 @@ contains
     real(8), intent(in),  value  :: a_in, b_in
     real(4), intent(out), device :: res_r4(1), res_hi(1), res_lo(1)
     type(fltflt) :: a, b, c
-    a = init(a_in);  b = init(b_in)           ! exact 2-component splits
+    a = fltflt_init(a_in);  b = fltflt_init(b_in)           ! exact 2-component splits
     res_r4(1) = real(a_in, 4) - real(b_in, 4) ! naive: truncates 2^-25 away
     c = a - b
     res_hi(1) = c%hi;  res_lo(1) = c%lo
@@ -30,7 +30,7 @@ end module tut_sub_r8_kern
 
 program tut_sub_r8
   use cudafor
-  use mod_ffp
+  use fltflt
   use tut_sub_r8_kern
   implicit none
 

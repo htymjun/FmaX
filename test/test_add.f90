@@ -10,8 +10,12 @@
 module test_add_kern
   use cudafor
   use cudadevice
-  use mod_ffp
+  use fltflt
   implicit none
+  private
+  public :: NCASE, N_DOT, N_BENCH, NITER, NBLK
+  public :: kern_add, kern_dotprod
+  public :: kern_bench_add_r4, kern_bench_add_r8, kern_bench_add_ff
 
   integer, parameter :: NCASE   = 4
   integer, parameter :: N_DOT   = 1024
@@ -30,7 +34,7 @@ contains
     integer :: i
     i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
     if (i > n) return
-    af = init(a_d(i));  bf = init(b_d(i))
+    af = fltflt_init(a_d(i));  bf = fltflt_init(b_d(i))
     res_r4(i) = real(a_d(i), 4) + real(b_d(i), 4)
     cf = af + bf
     res_hi(i) = cf%hi;  res_lo(i) = cf%lo
@@ -51,7 +55,7 @@ contains
     warp_id = (threadIdx%x - 1) / 32
 
     if (i <= n) then
-      acc    = init(a_d(i)) * init(b_d(i))
+      acc    = fltflt_init(a_d(i)) * fltflt_init(b_d(i))
       acc_r4 = real(a_d(i), 4) * real(b_d(i), 4)
     else
       acc%hi = 0.0_4;  acc%lo = 0.0_4;  acc_r4 = 0.0_4
@@ -59,7 +63,7 @@ contains
 
     delta = 16
     do while (delta >= 1)
-      other  = shfl_down_ff(acc, delta)
+      other  = fltflt_shfl_down(acc, delta)
       acc    = acc + other
       acc_r4 = acc_r4 + __shfl_down(acc_r4, delta)
       delta  = delta / 2
@@ -75,7 +79,7 @@ contains
       acc%hi = smem_hi(lane);  acc%lo = smem_lo(lane);  acc_r4 = smem_r4(lane)
       delta  = 16
       do while (delta >= 1)
-        other  = shfl_down_ff(acc, delta)
+        other  = fltflt_shfl_down(acc, delta)
         acc    = acc + other
         acc_r4 = acc_r4 + __shfl_down(acc_r4, delta)
         delta  = delta / 2
@@ -125,7 +129,7 @@ contains
     integer :: i, j
     i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
     if (i > n) return
-    xf = init(a_d(i));  bf = init(b_d(i))
+    xf = fltflt_init(a_d(i));  bf = fltflt_init(b_d(i))
     do j = 1, niter
       xf = xf + bf
     end do
@@ -137,7 +141,7 @@ end module test_add_kern
 
 program test_add
   use cudafor
-  use mod_ffp
+  use fltflt
   use test_add_kern
   implicit none
 
@@ -259,25 +263,25 @@ contains
     ! real(4)
     call kern_bench_add_r4<<<blk,thr>>>(NB, NI, ad, bd, out_r4)
     is = cudaDeviceSynchronize()
-    is = cudaEventRecord(t0, 0)
+    is = cudaEventRecord(t0, 0_8)
     call kern_bench_add_r4<<<blk,thr>>>(NB, NI, ad, bd, out_r4)
-    is = cudaEventRecord(t1, 0);  is = cudaEventSynchronize(t1)
+    is = cudaEventRecord(t1, 0_8);  is = cudaEventSynchronize(t1)
     is = cudaEventElapsedTime(elapsed, t0, t1);  ms_r4 = dble(elapsed)
 
     ! real(8)
     call kern_bench_add_r8<<<blk,thr>>>(NB, NI, ad, bd, out_r8)
     is = cudaDeviceSynchronize()
-    is = cudaEventRecord(t0, 0)
+    is = cudaEventRecord(t0, 0_8)
     call kern_bench_add_r8<<<blk,thr>>>(NB, NI, ad, bd, out_r8)
-    is = cudaEventRecord(t1, 0);  is = cudaEventSynchronize(t1)
+    is = cudaEventRecord(t1, 0_8);  is = cudaEventSynchronize(t1)
     is = cudaEventElapsedTime(elapsed, t0, t1);  ms_r8 = dble(elapsed)
 
     ! fltflt
     call kern_bench_add_ff<<<blk,thr>>>(NB, NI, ad, bd, out_hi, out_lo)
     is = cudaDeviceSynchronize()
-    is = cudaEventRecord(t0, 0)
+    is = cudaEventRecord(t0, 0_8)
     call kern_bench_add_ff<<<blk,thr>>>(NB, NI, ad, bd, out_hi, out_lo)
-    is = cudaEventRecord(t1, 0);  is = cudaEventSynchronize(t1)
+    is = cudaEventRecord(t1, 0_8);  is = cudaEventSynchronize(t1)
     is = cudaEventElapsedTime(elapsed, t0, t1);  ms_ff = dble(elapsed)
 
     is = cudaEventDestroy(t0);  is = cudaEventDestroy(t1)

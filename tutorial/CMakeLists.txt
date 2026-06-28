@@ -10,13 +10,13 @@ if(NOT DEFINED CASE_GPU_CC)
 endif()
 
 # Inline EFT helpers for optimal GPU performance (same flags as ouxmix/).
-set(FFP_INLINE "name:two_sum,name:fast_two_sum,name:two_prod,name:shfl_down_ff,name:shfl_xor_ff")
+set(FFP_INLINE "name:fltflt_two_sum,name:fltflt_fast_two_sum,name:fltflt_two_prod_fma,name:fltflt_abs,name:fltflt_sqrt,name:fltflt_sqrt_fast,name:fltflt_dot3,name:fltflt_shfl_down,name:fltflt_shfl_xor")
 set(CMAKE_Fortran_FLAGS
   "-cuda -fast -Mpreprocess -Minline=${FFP_INLINE} -Minfo=accel,inline -gpu=ptxinfo,rdc,lto,cc${CASE_GPU_CC}")
 
-set(LIB ../ouxmix/mod_ffp_eft.f90 ../ouxmix/mod_ffp.f90)
+set(LIB ../ouxmix/fltflt.f90)
 
-foreach(op add sub mul div add_r8 sub_r8 mul_r8 div_r8)
+foreach(op add sub mul div add_r8 sub_r8 mul_r8 div_r8 dot3)
   add_executable(tut_${op} tut_${op}.f90 ${LIB})
   set_target_properties(tut_${op} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")

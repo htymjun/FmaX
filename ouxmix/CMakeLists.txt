@@ -11,12 +11,12 @@ endif()
 
 # Inline the EFT helpers so two_prod maps to a single FMAF.F32 instruction.
 # -fast is required: enables -Mfma so fma() generates hardware FMA (not a,b,-hi sequence).
-set(FFP_INLINE "name:two_sum,name:fast_two_sum,name:two_prod,name:shfl_down_ff,name:shfl_xor_ff")
+set(FFP_INLINE "name:fltflt_two_sum,name:fltflt_fast_two_sum,name:fltflt_two_prod_fma,name:fltflt_add_same_sign,name:fltflt_fma,name:fltflt_fma_approx,name:fltflt_abs,name:fltflt_sqrt,name:fltflt_sqrt_fast,name:fltflt_norm3d,name:fltflt_dot2,name:fltflt_dot3,name:fltflt_add3,name:fltflt_add4,name:fltflt_add5,name:fltflt_square,name:fltflt_recip,name:fltflt_shfl_down,name:fltflt_shfl_xor")
 set(CMAKE_Fortran_FLAGS
   "-cuda -fast -Mpreprocess -Minline=${FFP_INLINE} -Minfo=accel,inline -gpu=ptxinfo,rdc,lto,cc${CASE_GPU_CC}")
 
-foreach(op add sub mul div bench)
-  add_executable(test_${op} ../test/test_${op}.f90 mod_ffp_eft.f90 mod_ffp.f90)
+foreach(op add sub mul div bench dot cmp fma math)
+  add_executable(test_${op} ../test/test_${op}.f90 fltflt.f90)
   set_target_properties(test_${op} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endforeach()

@@ -1,3 +1,11 @@
 */build
 *.mod
 *.o
+*.bin
+*.gpu
+*.ptx
+*.fat
+*.csv
+*.png
+*.cubin
+*.s

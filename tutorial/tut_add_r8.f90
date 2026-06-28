@@ -4,7 +4,7 @@
 ! Run:    cd build && ./tut_add_r8
 !
 ! Demonstrates init_from_r8: a real(8) value is split exactly into (hi + lo)
-! of two real(4) components by init().  Subsequent fltflt arithmetic then
+! of two real(4) components by fltflt_init().  Subsequent fltflt arithmetic then
 ! preserves near-real(8) accuracy, unlike truncating to real(4) first.
 !
 ! Input: a=1.0d8, b=1.0d0.  ULP(real(4)(1e8))=8, so b is absorbed when
@@ -12,7 +12,7 @@
 
 module tut_add_r8_kern
   use cudafor
-  use mod_ffp
+  use fltflt
   implicit none
 contains
 
@@ -21,7 +21,7 @@ contains
     real(8), intent(in),  value  :: a_in, b_in
     real(4), intent(out), device :: res_r4(1), res_hi(1), res_lo(1)
     type(fltflt) :: a, b, c
-    a = init(a_in);  b = init(b_in)           ! exact 2-component splits
+    a = fltflt_init(a_in);  b = fltflt_init(b_in)           ! exact 2-component splits
     res_r4(1) = real(a_in, 4) + real(b_in, 4) ! naive: truncate first, then add
     c = a + b
     res_hi(1) = c%hi;  res_lo(1) = c%lo
@@ -32,7 +32,7 @@ end module tut_add_r8_kern
 
 program tut_add_r8
   use cudafor
-  use mod_ffp
+  use fltflt
   use tut_add_r8_kern
   implicit none
 

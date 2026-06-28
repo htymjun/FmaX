@@ -9,7 +9,7 @@
 
 module test_bench_kern
   use cudafor
-  use mod_ffp
+  use fltflt
   implicit none
 
   integer, parameter :: N_BENCH = 2**20
@@ -41,7 +41,7 @@ contains
     integer :: i, j
     i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
     if (i > n) return
-    af = init(a_d(i));  bf = init(b_d(i));  xf = af
+    af = fltflt_init(a_d(i));  bf = fltflt_init(b_d(i));  xf = af
     do j = 1, niter
       xf = xf * bf + af
     end do
@@ -53,7 +53,7 @@ end module test_bench_kern
 
 program test_bench
   use cudafor
-  use mod_ffp
+  use fltflt
   use test_bench_kern
   implicit none
 
@@ -83,9 +83,9 @@ program test_bench
   ! Warmup + time real(8)
   call kern_bench_r8<<<blk, thr>>>(N, NI, a_d, b_d, out_r8)
   istat = cudaDeviceSynchronize()
-  istat = cudaEventRecord(t_start, 0)
+  istat = cudaEventRecord(t_start, 0_8)
   call kern_bench_r8<<<blk, thr>>>(N, NI, a_d, b_d, out_r8)
-  istat = cudaEventRecord(t_stop, 0)
+  istat = cudaEventRecord(t_stop, 0_8)
   istat = cudaEventSynchronize(t_stop)
   istat = cudaEventElapsedTime(elapsed, t_start, t_stop)
   ms_r8 = dble(elapsed)
@@ -93,9 +93,9 @@ program test_bench
   ! Warmup + time fltflt
   call kern_bench_ff<<<blk, thr>>>(N, NI, a_d, b_d, out_hi, out_lo)
   istat = cudaDeviceSynchronize()
-  istat = cudaEventRecord(t_start, 0)
+  istat = cudaEventRecord(t_start, 0_8)
   call kern_bench_ff<<<blk, thr>>>(N, NI, a_d, b_d, out_hi, out_lo)
-  istat = cudaEventRecord(t_stop, 0)
+  istat = cudaEventRecord(t_stop, 0_8)
   istat = cudaEventSynchronize(t_stop)
   istat = cudaEventElapsedTime(elapsed, t_start, t_stop)
   ms_ff = dble(elapsed)

@@ -9,7 +9,7 @@
 
 module test_mul_kern
   use cudafor
-  use mod_ffp
+  use fltflt
   implicit none
 
   integer, parameter :: NCASE   = 4
@@ -28,7 +28,7 @@ contains
     integer :: i
     i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
     if (i > n) return
-    af = init(a_d(i));  bf = init(b_d(i))
+    af = fltflt_init(a_d(i));  bf = fltflt_init(b_d(i))
     res_r4(i) = real(a_d(i), 4) * real(b_d(i), 4)
     cf = af * bf
     res_hi(i) = cf%hi;  res_lo(i) = cf%lo
@@ -73,7 +73,7 @@ contains
     integer :: i, j
     i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
     if (i > n) return
-    xf = init(a_d(i));  bf = init(b_d(i))
+    xf = fltflt_init(a_d(i));  bf = fltflt_init(b_d(i))
     do j = 1, niter
       xf = xf * bf
     end do
@@ -85,7 +85,7 @@ end module test_mul_kern
 
 program test_mul
   use cudafor
-  use mod_ffp
+  use fltflt
   use test_mul_kern
   implicit none
 
@@ -175,25 +175,25 @@ contains
     ! real(4)
     call kern_bench_mul_r4<<<blk,thr>>>(NB, NI, ad, bd, out_r4)
     is = cudaDeviceSynchronize()
-    is = cudaEventRecord(t0, 0)
+    is = cudaEventRecord(t0, 0_8)
     call kern_bench_mul_r4<<<blk,thr>>>(NB, NI, ad, bd, out_r4)
-    is = cudaEventRecord(t1, 0);  is = cudaEventSynchronize(t1)
+    is = cudaEventRecord(t1, 0_8);  is = cudaEventSynchronize(t1)
     is = cudaEventElapsedTime(elapsed, t0, t1);  ms_r4 = dble(elapsed)
 
     ! real(8)
     call kern_bench_mul_r8<<<blk,thr>>>(NB, NI, ad, bd, out_r8)
     is = cudaDeviceSynchronize()
-    is = cudaEventRecord(t0, 0)
+    is = cudaEventRecord(t0, 0_8)
     call kern_bench_mul_r8<<<blk,thr>>>(NB, NI, ad, bd, out_r8)
-    is = cudaEventRecord(t1, 0);  is = cudaEventSynchronize(t1)
+    is = cudaEventRecord(t1, 0_8);  is = cudaEventSynchronize(t1)
     is = cudaEventElapsedTime(elapsed, t0, t1);  ms_r8 = dble(elapsed)
 
     ! fltflt
     call kern_bench_mul_ff<<<blk,thr>>>(NB, NI, ad, bd, out_hi, out_lo)
     is = cudaDeviceSynchronize()
-    is = cudaEventRecord(t0, 0)
+    is = cudaEventRecord(t0, 0_8)
     call kern_bench_mul_ff<<<blk,thr>>>(NB, NI, ad, bd, out_hi, out_lo)
-    is = cudaEventRecord(t1, 0);  is = cudaEventSynchronize(t1)
+    is = cudaEventRecord(t1, 0_8);  is = cudaEventSynchronize(t1)
     is = cudaEventElapsedTime(elapsed, t0, t1);  ms_ff = dble(elapsed)
 
     is = cudaEventDestroy(t0);  is = cudaEventDestroy(t1)

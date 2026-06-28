@@ -10,7 +10,7 @@
 
 module tut_sub_kern
   use cudafor
-  use mod_ffp
+  use fltflt
   implicit none
 contains
 
@@ -20,7 +20,7 @@ contains
     real(4), intent(in),  value  :: b_r4
     real(4), intent(out), device :: res_r4(1), res_hi(1), res_lo(1)
     type(fltflt) :: a, c
-    a = init(a_r8)                   ! exact 2-component split of the double
+    a = fltflt_init(a_r8)                   ! exact 2-component split of the double
     res_r4(1) = real(a_r8, 4) - b_r4 ! naive: truncates a to r4 first
     c = a - b_r4
     res_hi(1) = c%hi;  res_lo(1) = c%lo
@@ -31,7 +31,7 @@ end module tut_sub_kern
 
 program tut_sub
   use cudafor
-  use mod_ffp
+  use fltflt
   use tut_sub_kern
   implicit none
 
