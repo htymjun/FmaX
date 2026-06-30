@@ -11,6 +11,9 @@ module test_bench_kern
   use cudafor
   use fltflt
   implicit none
+  private
+  public :: N_BENCH, NITER, NBLK
+  public :: kern_bench_r8, kern_bench_ff
 
   integer, parameter :: N_BENCH = 2**20
   integer, parameter :: NITER   = 100

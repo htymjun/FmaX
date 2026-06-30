@@ -11,6 +11,10 @@ module test_sub_kern
   use cudafor
   use fltflt
   implicit none
+  private
+  public :: NCASE, N_BENCH, NITER, NBLK
+  public :: kern_sub
+  public :: kern_bench_sub_r4, kern_bench_sub_r8, kern_bench_sub_ff
 
   integer, parameter :: NCASE   = 4
   integer, parameter :: N_BENCH = 2**20

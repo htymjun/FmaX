@@ -78,8 +78,8 @@ Public API (all `pure attributes(device)` unless noted):
 - `fltflt_dot3(a,b,c,d,e,f)` — exact `a*b + c*d + e*f`
 - `fltflt_dot4(a,b,c,d,e,f,g,h)` — exact 4-pair dot product
 - `fltflt_abs(a)` — branchless absolute value
-- `fltflt_sqrt(a)` — Newton-step square root
-- `fltflt_sqrt_fast(a)` — ~7-flop rsqrt-based square root
+- `fltflt_sqrt(a)` — Newton-step square root; returns `(0,0)` for zero input (guard required because `0/0 = NaN`)
+- `fltflt_sqrt_fast(a)` — ~7-flop rsqrt-based square root; also guards zero input
 - `fltflt_norm3d(dx,dy,dz)` — `sqrt(dx^2 + dy^2 + dz^2)`
 - `fltflt_hypot(a,b)` — `sqrt(a^2 + b^2)` for `real(4)` inputs via exact dot2
 - `fltflt_round_to_nearest(a)`, `fltflt_round_toward_zero(a)`, `fltflt_floor(a)`, `fltflt_ceil(a)` — rounding
@@ -88,7 +88,7 @@ Public API (all `pure attributes(device)` unless noted):
 - `fltflt_sign(a,b)` — copysign: magnitude of a with sign of b
 - `fltflt_lerp(a,b,t)` — linear interpolation `a + t*(b-a)`, `t :: real(4)`
 - `fltflt_pow_int(a,n)` — `a^n` for non-negative integer n; not `pure`
-- `fltflt_cross3d(cx,cy,cz, ax,ay,az, bx,by,bz)` — 3D cross product (subroutine); uses dot2 for exact cancellation
+- `fltflt_cross3d(cx,cy,cz, ax,ay,az, bx,by,bz)` — 3D cross product (`pure` subroutine); uses dot2 for exact cancellation
 - `fltflt_shfl_down(a,delta)`, `fltflt_shfl_xor(a,mask)` — warp shuffles for `fltflt`
 - `fltflt_warp_reduce_sum(val)` — XOR-butterfly all-reduce across 32 lanes; not `pure`
 
@@ -109,5 +109,7 @@ Programs (one per operation domain), each containing a `module test_*_kern` with
 - **Kernel module `private`**: Any module that does `use cudafor` (or `use fltflt`) and is itself used by a program that also does `use cudafor` must declare `private` with explicit `public` for its kernel names. Without `private`, the module re-exports all cudafor generic interfaces, causing nvfortran 24.7 to fail resolving `cudaEventRecord`/`cudaEventDestroy` in internal subroutines with "Could not resolve generic procedure".
 
 - **cudaEventRecord stream argument**: Requires `integer(8)` (e.g. `0_8`), not default `integer`. Default int triggers "Could not resolve generic procedure" in nvfortran 24.7.
+
+- **Fortran `mod` sign follows dividend**: `mod(-3.0, 2.0) = -1.0` (not `+1.0`). Even-parity checks must use `mod(x, 2.0) == 0.0`, not `mod(a, 2.0) == mod(b, 2.0)` — the latter fails when `a` and `b` have opposite signs and are both odd. `fltflt_round_to_nearest` uses `mod(a%hi + r_lo, 2.0) /= 0.0` for exactly this reason.
 
 - **`.not.` operator broken on logical in device code**: In nvfortran, `.true.` is represented as the integer `+1` (not `-1` as in many Fortran implementations). Bitwise `.not.(+1)` = `0xFFFFFFFE` = `-2`, which is non-zero and therefore "true" in CUDA. Consequence: `.not. .true.` evaluates to "true" instead of "false". Affected functions: any `/=` implementation written as `.not. (==)`. Fix: implement `ne` directly using `/=` combined with `.or.`, never via `.not. eq_*()`. This is why `ne_ff_ff`, `ne_ff_r4`, and `ne_r4_ff` in `fltflt.f90` avoid `.not.`.

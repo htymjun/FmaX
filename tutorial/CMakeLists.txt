@@ -10,7 +10,7 @@ if(NOT DEFINED CASE_GPU_CC)
 endif()
 
 # Inline EFT helpers for optimal GPU performance (same flags as ouxmix/).
-set(FFP_INLINE "name:fltflt_two_sum,name:fltflt_fast_two_sum,name:fltflt_two_prod_fma,name:fltflt_abs,name:fltflt_sqrt,name:fltflt_sqrt_fast,name:fltflt_dot3,name:fltflt_shfl_down,name:fltflt_shfl_xor")
+set(FFP_INLINE "name:fltflt_two_sum,name:fltflt_fast_two_sum,name:fltflt_two_prod_fma,name:fltflt_abs,name:fltflt_sqrt,name:fltflt_sqrt_fast,name:dot3_r4,name:dot3_r8,name:dot3_ff,name:fltflt_shfl_down,name:fltflt_shfl_xor")
 set(CMAKE_Fortran_FLAGS
   "-cuda -fast -Mpreprocess -Minline=${FFP_INLINE} -Minfo=accel,inline -gpu=ptxinfo,rdc,lto,cc${CASE_GPU_CC}")
 

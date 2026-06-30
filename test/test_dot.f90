@@ -11,6 +11,10 @@ module test_dot_kern
   use cudafor
   use fltflt
   implicit none
+  private
+  public :: NCASE, N_BENCH, NITER, NBLK
+  public :: kern_dot3
+  public :: kern_bench_dot3_r4, kern_bench_dot3_ff
 
   integer, parameter :: NCASE   = 4
   integer, parameter :: N_BENCH = 2**20

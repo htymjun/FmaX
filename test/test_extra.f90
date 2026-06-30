@@ -11,6 +11,10 @@ module test_extra_kern
   use cudafor
   use fltflt
   implicit none
+  private
+  public :: NCASE, NBLK
+  public :: kern_dot2_all, kern_dot3_all, kern_dot4_all
+  public :: kern_util, kern_warp_reduce
 
   integer, parameter :: NCASE = 8
   integer, parameter :: NBLK  = 256

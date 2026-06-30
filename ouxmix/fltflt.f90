@@ -1041,6 +1041,9 @@ contains
     type(fltflt), intent(in) :: a
     type(fltflt) :: c, p
     real(4) :: q1, s, q2
+    if (a%hi == 0.0) then
+      c%hi = 0.0;  c%lo = 0.0;  return
+    end if
     q1 = sqrt(a%hi)
     p  = fltflt_two_prod_fma(q1, q1)
     s  = (a%hi - p%hi - p%lo) + a%lo
@@ -1179,7 +1182,7 @@ contains
       if (abs(frac) > 0.5) then
         r_lo = r_lo + sign(1.0, frac)
       else if (abs(frac) == 0.5) then
-        if (mod(a%hi, 2.0) /= mod(r_lo, 2.0)) then
+        if (mod(a%hi + r_lo, 2.0) /= 0.0) then
           r_lo = r_lo + sign(1.0, frac)
         end if
       end if
@@ -1339,7 +1342,7 @@ contains
 
   ! fltflt_cross3d: a x b = (ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx).
   ! Uses fltflt_dot2 for exact cancellation in each component. 3 x (8 flops + 2 FMAs).
-  attributes(device) subroutine fltflt_cross3d(cx, cy, cz, ax, ay, az, bx, by, bz)
+  pure attributes(device) subroutine fltflt_cross3d(cx, cy, cz, ax, ay, az, bx, by, bz)
     type(fltflt), intent(out) :: cx, cy, cz
     real(4),      intent(in)  :: ax, ay, az, bx, by, bz
     cx = fltflt_dot2( ay, bz, -az, by)
