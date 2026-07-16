@@ -1,0 +1,58 @@
+!===============================================================================
+! FmaX: Performance-Maximizing Utility Library for CUDA Fortran
+! File: vfma.f90 (to be preprocessed with 'fypp')
+!===============================================================================
+module vfma
+  use libm
+  implicit none
+  private
+
+  ! Public interfaces and placeholders for future FmaX precision models
+  ! (e.g., float_float / double_double from MatX fltflt.h)
+  ! public :: float_float, double_double
+
+contains
+
+! clean_var_name, parse_arg, compute_loads, resolve_terms are Python helpers
+! from vfma_helpers.py, loaded via: fypp -M FmaX -m vfma_helpers ...
+! (fypp has no #:python/#:endpython directive for inline multi-statement code).
+! fypp's `-m` binds the imported module to a variable of its own name, not its
+! members, so calls below are qualified as vfma_helpers.<name>(...).
+
+#! =============================================================================
+#!  [FmaX Macro] : vfma
+#!  
+#!  Statically expands FMA operations into register-mapped scalar instructions.
+#!  Completely deduplicates global memory loads for overlapping stencil indices.
+#! =============================================================================
+#:def vfma(n, a_str, b_str, c_str, res_str)
+  #:set a_info = vfma_helpers.parse_arg(a_str, n)
+  #:set b_info = vfma_helpers.parse_arg(b_str, n)
+  #:set c_info = vfma_helpers.parse_arg(c_str, n)
+  #:set res_info = vfma_helpers.parse_arg(res_str, n)
+  #:set loads = vfma_helpers.compute_loads([a_info, b_info, c_info])
+
+  block
+  ! [1a] Register declarations (all specification statements before any executable ones)
+  #:for base, indices in loads.items()
+    #:for idx in sorted(list(indices))
+  real(8) :: ${vfma_helpers.clean_var_name(base, idx)}$
+    #:endfor
+  #:endfor
+
+  ! [1b] Bulk Register Loading (completely deduplicated, forcing exactly 1 load per element)
+  #:for base, indices in loads.items()
+    #:for idx in sorted(list(indices))
+  ${vfma_helpers.clean_var_name(base, idx)}$ = ${base}$(${idx}$)
+    #:endfor
+  #:endfor
+
+  ! [2] Inline FMA Expansion (zero-overhead execution, device-safe double-precision FMA)
+  #:for k in range(n)
+    #:set a_term, b_term, c_term, res_term = vfma_helpers.resolve_terms(a_info, b_info, c_info, res_info, k)
+  ${res_term}$ = __fma_rn(${a_term}$, ${b_term}$, ${c_term}$)
+  #:endfor
+  end block
+#:enddef
+
+end module vfma
