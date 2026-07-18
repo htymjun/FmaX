@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Hatayama"
+  given-names: "Jun"
+  orcid: "https://orcid.org/0009-0003-7502-2589"
+- family-names: "Yusuke"
+  given-names: "Ohnishi"
+title: "FmaX"
+version: 0.0.0
+date-released: 2026-07-18
+url: "https://github.com/htymjun/FmaX"
