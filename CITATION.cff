@@ -4,8 +4,8 @@ authors:
 - family-names: "Hatayama"
   given-names: "Jun"
   orcid: "https://orcid.org/0009-0003-7502-2589"
-- family-names: "Yusuke"
-  given-names: "Ohnishi"
+- family-names: "Ohnishi"
+  given-names: "Yusuke"
 title: "FmaX"
 version: 0.0.0
 date-released: 2026-07-18
