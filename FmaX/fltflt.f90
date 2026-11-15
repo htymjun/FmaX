@@ -71,6 +71,12 @@ module fltflt
     real(4) :: hi, lo
   end type fltflt
 
+  ! Quiet NaN from its bit pattern (fltflt_fmod with b == 0). A runtime 0/0
+  ! is foldable to 1.0 under finite-math assumptions; a constant is not.
+  ! (A transfer() inside a device function instead crashes nvfortran 26.5's
+  ! fort2 when the function is not pure.)
+  real(4), parameter :: ff_qnan = transfer(int(z'7FC00000', 4), 1.0_4)
+
   ! ================================================================
   ! Constructors
   ! ================================================================
@@ -212,32 +218,43 @@ contains
   ! EFT Backend (private) — names match fltflt.h counterparts
   ! ================================================================
 
+  ! Every floating-point step of an error-free transformation (and of every
+  ! renormalisation built on one) goes through __fadd_rn / __fmul_rn /
+  ! __fmaf_rn, exactly as fltflt.h does with detail::fadd_rn/fsub_rn/fmul_rn.
+  ! These intrinsics are never contracted into an FMA. With plain `+ - *`,
+  ! `-fast` (FMA contraction on) is free to fuse a product into a following
+  ! add once the routines are inlined -- e.g. r%hi = a*b of two_prod into the
+  ! adds of a following fast_two_sum -- and the transformation is no longer
+  ! exact (measured: 7e-8 instead of 1e-16 relative error). test/ builds the
+  ! suite with and without FMA contraction and requires bit-identical results.
+  ! nvfortran has no __fsub_rn: a - b is written __fadd_rn(a, -b) (negation
+  ! is exact, so this is the same operation).
+
   ! fltflt_two_sum: Knuth 1969 exact split, 6 flops, no precondition.
-  pure attributes(device) function fltflt_two_sum(a, b) result(r)
+  attributes(device) function fltflt_two_sum(a, b) result(r)
     real(4), intent(in) :: a, b
     type(fltflt) :: r
     real(4) :: v
-    r%hi = a + b
-    v    = r%hi - a
-    r%lo = (a - (r%hi - v)) + (b - v)
+    r%hi = __fadd_rn(a, b)
+    v    = __fadd_rn(r%hi, -a)
+    r%lo = __fadd_rn(__fadd_rn(a, -__fadd_rn(r%hi, -v)), __fadd_rn(b, -v))
   end function fltflt_two_sum
 
   ! fltflt_fast_two_sum: Dekker 1971, 3 flops, requires |a| >= |b|.
-  pure attributes(device) function fltflt_fast_two_sum(a, b) result(r)
+  attributes(device) function fltflt_fast_two_sum(a, b) result(r)
     real(4), intent(in) :: a, b
     type(fltflt) :: r
-    r%hi = a + b
-    r%lo = b - (r%hi - a)
+    r%hi = __fadd_rn(a, b)
+    r%lo = __fadd_rn(b, -__fadd_rn(r%hi, -a))
   end function fltflt_fast_two_sum
 
   ! fltflt_two_prod_fma: exact product via FMA. 1 MUL + 1 FMAF.F32.
-  ! Uses __fmaf_rn (cudadevice intrinsic) instead of a*b+c wrapper: the
-  ! wrapper allows the GPU optimizer to CSE a*b=hi and fold hi-hi to 0.
-  ! __fmaf_rn is opaque and maps directly to hardware FMAF.F32.
+  ! __fmul_rn keeps hi = RN(a*b) a separate rounding (a plain a*b could be
+  ! fused into a later add); __fmaf_rn computes a*b - hi exactly.
   attributes(device) function fltflt_two_prod_fma(a, b) result(r)
     real(4), intent(in) :: a, b
     type(fltflt) :: r
-    r%hi = a * b
+    r%hi = __fmul_rn(a, b)
     r%lo = __fmaf_rn(a, b, -r%hi)
   end function fltflt_two_prod_fma
 
@@ -252,12 +269,29 @@ contains
     r%lo = 0.0
   end function init_from_r4
 
-  ! Splits a double exactly into two non-overlapping single-precision halves.
+  ! Splits a double into two non-overlapping single-precision halves:
+  ! hi = RN(a), lo = RN(a - hi), then one FastTwoSum so that fl(hi + lo) == hi
+  ! holds even when lo rounds to exactly half an ulp of hi (otherwise the pair
+  ! is not canonical and the lexicographic comparisons misjudge it).
+  ! |a| > huge(1.0_4), Inf and NaN give (RN(a), 0) -- never (Inf, -Inf).
+  ! Same contract as fltflt.h's fltflt(double) host path; the device path of
+  ! fltflt.h extracts the halves from the bit pattern instead (no FP64
+  ! instruction), which can differ from this one in the last bit of lo.
+  ! Plain arithmetic is safe here (no product to contract) and keeps the
+  ! routine callable on the host.
   pure attributes(device, host) function init_from_r8(a) result(r)
     real(8), intent(in) :: a
     type(fltflt) :: r
+    real(4) :: s
     r%hi = real(a, 4)
-    r%lo = real(a - real(r%hi, 8), 4)
+    if (abs(r%hi) <= huge(1.0_4)) then
+      r%lo = real(a - real(r%hi, 8), 4)
+      s    = r%hi + r%lo
+      r%lo = r%lo - (s - r%hi)
+      r%hi = s
+    else
+      r%lo = 0.0
+    end if
   end function init_from_r8
 
   ! ================================================================
@@ -279,44 +313,42 @@ contains
   ! the lo accumulation before the final FastTwoSum.
   ! ================================================================
 
-  pure attributes(device) function add_ff_ff(a, b) result(c)
+  attributes(device) function add_ff_ff(a, b) result(c)
     type(fltflt), intent(in) :: a, b
     type(fltflt) :: c, s, t, q
     real(4) :: st_lo
     s     = fltflt_two_sum(a%hi, b%hi)
     t     = fltflt_two_sum(a%lo, b%lo)
     q     = fltflt_fast_two_sum(s%hi, t%hi)
-    st_lo = s%lo + t%lo
-    c     = fltflt_fast_two_sum(q%hi, st_lo + q%lo)
+    st_lo = __fadd_rn(s%lo, t%lo)
+    c     = fltflt_fast_two_sum(q%hi, __fadd_rn(st_lo, q%lo))
   end function add_ff_ff
 
   ! ff + scalar: b%lo = 0 inlined, saves one TwoSum. ~9 flops.
-  pure attributes(device) function add_ff_r4(a, b) result(c)
+  attributes(device) function add_ff_r4(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(4),      intent(in) :: b
     type(fltflt) :: c, s
     s    = fltflt_two_sum(a%hi, b)
-    s%lo = s%lo + a%lo
+    s%lo = __fadd_rn(s%lo, a%lo)
     c    = fltflt_fast_two_sum(s%hi, s%lo)
   end function add_ff_r4
 
-  pure attributes(device) function add_r4_ff(a, b) result(c)
+  attributes(device) function add_r4_ff(a, b) result(c)
     real(4),      intent(in) :: a
     type(fltflt), intent(in) :: b
     type(fltflt) :: c
     c = add_ff_r4(b, a)
   end function add_r4_ff
 
-  pure attributes(device) function add_ff_r8(a, b) result(c)
+  attributes(device) function add_ff_r8(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(8),      intent(in) :: b
-    type(fltflt) :: c, b_ff
-    b_ff%hi = real(b, 4)
-    b_ff%lo = real(b - real(b_ff%hi, 8), 4)
-    c = add_ff_ff(a, b_ff)
+    type(fltflt) :: c
+    c = add_ff_ff(a, init_from_r8(b))
   end function add_ff_r8
 
-  pure attributes(device) function add_r8_ff(a, b) result(c)
+  attributes(device) function add_r8_ff(a, b) result(c)
     real(8),      intent(in) :: a
     type(fltflt), intent(in) :: b
     type(fltflt) :: c
@@ -327,34 +359,34 @@ contains
   ! Subtraction
   ! ================================================================
 
-  pure attributes(device) function sub_ff_ff(a, b) result(c)
+  attributes(device) function sub_ff_ff(a, b) result(c)
     type(fltflt), intent(in) :: a, b
     type(fltflt) :: c
     c = add_ff_ff(a, neg_ff(b))
   end function sub_ff_ff
 
-  pure attributes(device) function sub_ff_r4(a, b) result(c)
+  attributes(device) function sub_ff_r4(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(4),      intent(in) :: b
     type(fltflt) :: c
     c = add_ff_r4(a, -b)
   end function sub_ff_r4
 
-  pure attributes(device) function sub_r4_ff(a, b) result(c)
+  attributes(device) function sub_r4_ff(a, b) result(c)
     real(4),      intent(in) :: a
     type(fltflt), intent(in) :: b
     type(fltflt) :: c
     c = add_ff_r4(neg_ff(b), a)
   end function sub_r4_ff
 
-  pure attributes(device) function sub_ff_r8(a, b) result(c)
+  attributes(device) function sub_ff_r8(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(8),      intent(in) :: b
     type(fltflt) :: c
     c = add_ff_r8(a, -b)
   end function sub_ff_r8
 
-  pure attributes(device) function sub_r8_ff(a, b) result(c)
+  attributes(device) function sub_r8_ff(a, b) result(c)
     real(8),      intent(in) :: a
     type(fltflt), intent(in) :: b
     type(fltflt) :: c
@@ -370,7 +402,8 @@ contains
     type(fltflt), intent(in) :: a, b
     type(fltflt) :: c, p
     p    = fltflt_two_prod_fma(a%hi, b%hi)
-    p%lo = __fmaf_rn(a%hi, b%lo, __fmaf_rn(a%lo, b%hi, p%lo))
+    p%lo = __fmaf_rn(a%hi, b%lo, p%lo)
+    p%lo = __fmaf_rn(a%lo, b%hi, p%lo)
     c    = fltflt_fast_two_sum(p%hi, p%lo)
   end function mul_ff_ff
 
@@ -394,10 +427,8 @@ contains
   attributes(device) function mul_ff_r8(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(8),      intent(in) :: b
-    type(fltflt) :: c, b_ff
-    b_ff%hi = real(b, 4)
-    b_ff%lo = real(b - real(b_ff%hi, 8), 4)
-    c = mul_ff_ff(a, b_ff)
+    type(fltflt) :: c
+    c = mul_ff_ff(a, init_from_r8(b))
   end function mul_ff_r8
 
   attributes(device) function mul_r8_ff(a, b) result(c)
@@ -408,64 +439,69 @@ contains
   end function mul_r8_ff
 
   ! ================================================================
-  ! Division (Dekker 1971, one Newton-step refinement)
+  ! Division: Karp's algorithm (Thall 2006, Alg. 6), as fltflt.h's fltflt_div
   !
-  ! q1 = a%hi / b%hi                  first quotient approximation
-  ! (p%hi, p%lo) = TwoProdFMA(q1, b%hi)  exact q1*b%hi
-  ! s = a%hi - p%hi                   residual high part
-  ! e = s - p%lo + a%lo - q1*b%lo     full residual ≈ a - q1*b
-  ! q2 = e / b%hi                     Newton correction
+  ! xn = 1/b%hi (IEEE, __fdiv_rn)      reciprocal of the leading part
+  ! yn = a%hi*xn                       first quotient approximation
+  ! diff = a - yn*b                    exact-product residual via fltflt_fma
+  ! q = TwoProd(xn, diff%hi) + yn      Newton correction, one renormalisation
+  !
+  ! b == 0 gives xn = 0 and therefore a/0 = 0 (not Inf/NaN) -- fltflt.h's
+  ! semantics, kept so that the two libraries agree bit for bit.
   ! ================================================================
 
   attributes(device) function div_ff_ff(a, b) result(c)
     type(fltflt), intent(in) :: a, b
-    type(fltflt) :: c, p
-    real(4) :: q1, q2, s, e
-    q1   = a%hi / b%hi
-    p    = fltflt_two_prod_fma(q1, b%hi)
-    s    = a%hi - p%hi
-    e    = __fmaf_rn(-q1, b%lo, s - p%lo + a%lo)
-    q2   = e / b%hi
-    c    = fltflt_fast_two_sum(q1, q2)
+    type(fltflt) :: c, diff, prod
+    real(4) :: xn, yn
+    xn   = 0.0
+    if (b%hi /= 0.0) xn = __fdiv_rn(1.0, b%hi)
+    yn   = __fmul_rn(a%hi, xn)
+    diff = fma_r4_ff_ff(-yn, b, a)
+    prod = fltflt_two_prod_fma(xn, diff%hi)
+    c    = add_ff_r4(prod, yn)
   end function div_ff_ff
 
-  ! ff/scalar: b%lo = 0 inlined.
+  ! ff/scalar: b%lo = 0.
   attributes(device) function div_ff_r4(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(4),      intent(in) :: b
-    type(fltflt) :: c, p
-    real(4) :: q1, q2, s, e
-    q1   = a%hi / b
-    p    = fltflt_two_prod_fma(q1, b)
-    s    = a%hi - p%hi
-    e    = s - p%lo + a%lo
-    q2   = e / b
-    c    = fltflt_fast_two_sum(q1, q2)
+    type(fltflt) :: c, diff, prod
+    real(4) :: xn, yn
+    xn   = 0.0
+    if (b /= 0.0) xn = __fdiv_rn(1.0, b)
+    yn   = __fmul_rn(a%hi, xn)
+    diff = fma_r4_r4_ff(-yn, b, a)
+    prod = fltflt_two_prod_fma(xn, diff%hi)
+    c    = add_ff_r4(prod, yn)
   end function div_ff_r4
 
+  ! scalar/ff: a%lo = 0.
   attributes(device) function div_r4_ff(a, b) result(c)
     real(4),      intent(in) :: a
     type(fltflt), intent(in) :: b
-    type(fltflt) :: c
-    c = div_ff_ff(init_from_r4(a), b)
+    type(fltflt) :: c, diff, prod
+    real(4) :: xn, yn
+    xn   = 0.0
+    if (b%hi /= 0.0) xn = __fdiv_rn(1.0, b%hi)
+    yn   = __fmul_rn(a, xn)
+    diff = fma_r4_ff_r4(-yn, b, a)
+    prod = fltflt_two_prod_fma(xn, diff%hi)
+    c    = add_ff_r4(prod, yn)
   end function div_r4_ff
 
   attributes(device) function div_ff_r8(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(8),      intent(in) :: b
-    type(fltflt) :: c, b_ff
-    b_ff%hi = real(b, 4)
-    b_ff%lo = real(b - real(b_ff%hi, 8), 4)
-    c = div_ff_ff(a, b_ff)
+    type(fltflt) :: c
+    c = div_ff_ff(a, init_from_r8(b))
   end function div_ff_r8
 
   attributes(device) function div_r8_ff(a, b) result(c)
     real(8),      intent(in) :: a
     type(fltflt), intent(in) :: b
-    type(fltflt) :: c, a_ff
-    a_ff%hi = real(a, 4)
-    a_ff%lo = real(a - real(a_ff%hi, 8), 4)
-    c = div_ff_ff(a_ff, b)
+    type(fltflt) :: c
+    c = div_ff_ff(init_from_r8(a), b)
   end function div_r8_ff
 
   ! ================================================================
@@ -623,28 +659,28 @@ contains
   ! Saves 9 flops vs fltflt_add_ff_ff for sign-guaranteed inputs.
   ! ================================================================
 
-  pure attributes(device) function add_same_sign_ff_ff(a, b) result(c)
+  attributes(device) function add_same_sign_ff_ff(a, b) result(c)
     type(fltflt), intent(in) :: a, b
     type(fltflt) :: c, r
     real(4) :: s
     r = fltflt_two_sum(a%hi, b%hi)
-    s = (r%lo + b%lo) + a%lo
+    s = __fadd_rn(__fadd_rn(r%lo, b%lo), a%lo)
     c = fltflt_fast_two_sum(r%hi, s)
   end function add_same_sign_ff_ff
 
   ! ff + r4 variant (b%lo = 0).
-  pure attributes(device) function add_same_sign_ff_r4(a, b) result(c)
+  attributes(device) function add_same_sign_ff_r4(a, b) result(c)
     type(fltflt), intent(in) :: a
     real(4),      intent(in) :: b
     type(fltflt) :: c, r
     real(4) :: s
     r = fltflt_two_sum(a%hi, b)
-    s = r%lo + a%lo
+    s = __fadd_rn(r%lo, a%lo)
     c = fltflt_fast_two_sum(r%hi, s)
   end function add_same_sign_ff_r4
 
   ! r4 + ff variant: commutative, delegates to ff+r4.
-  pure attributes(device) function add_same_sign_r4_ff(a, b) result(c)
+  attributes(device) function add_same_sign_r4_ff(a, b) result(c)
     real(4),      intent(in) :: a
     type(fltflt), intent(in) :: b
     type(fltflt) :: c
@@ -667,14 +703,15 @@ contains
     p%lo = __fmaf_rn(a%hi, b%lo, p%lo)
     p%lo = __fmaf_rn(a%lo, b%hi, p%lo)
     s    = fltflt_two_sum(p%hi, c%hi)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
     s    = fltflt_fast_two_sum(s%hi, s%lo)
-    s%lo = s%lo + c%lo
+    s%lo = __fadd_rn(s%lo, c%lo)
     s%lo = __fmaf_rn(a%lo, b%lo, s%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_ff_ff_ff
 
-  ! ff*ff + r4: c%lo = 0, skip a%lo*b%lo term.
+  ! ff*ff + r4: c%lo = 0. Keeps the a%lo*b%lo term, which carries the
+  ! answer when a*b cancels against c (only fma_approx drops it).
   attributes(device) function fma_ff_ff_r4(a, b, c) result(r)
     type(fltflt), intent(in) :: a, b
     real(4),      intent(in) :: c
@@ -683,7 +720,8 @@ contains
     p%lo = __fmaf_rn(a%hi, b%lo, p%lo)
     p%lo = __fmaf_rn(a%lo, b%hi, p%lo)
     s    = fltflt_two_sum(p%hi, c)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
+    s%lo = __fmaf_rn(a%lo, b%lo, s%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_ff_ff_r4
 
@@ -695,9 +733,9 @@ contains
     p    = fltflt_two_prod_fma(a, b%hi)
     p%lo = __fmaf_rn(a, b%lo, p%lo)
     s    = fltflt_two_sum(p%hi, c%hi)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
     s    = fltflt_fast_two_sum(s%hi, s%lo)
-    s%lo = s%lo + c%lo
+    s%lo = __fadd_rn(s%lo, c%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_r4_ff_ff
 
@@ -717,7 +755,7 @@ contains
     p    = fltflt_two_prod_fma(a%hi, b)
     p%lo = __fmaf_rn(a%lo, b, p%lo)
     s    = fltflt_two_sum(p%hi, c)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_ff_r4_r4
 
@@ -736,9 +774,9 @@ contains
     type(fltflt) :: r, p, s
     p    = fltflt_two_prod_fma(a, b)
     s    = fltflt_two_sum(p%hi, c%hi)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
     s    = fltflt_fast_two_sum(s%hi, s%lo)
-    s%lo = s%lo + c%lo
+    s%lo = __fadd_rn(s%lo, c%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_r4_r4_ff
 
@@ -757,9 +795,9 @@ contains
     p%lo = __fmaf_rn(a%hi, b%lo, p%lo)
     p%lo = __fmaf_rn(a%lo, b%hi, p%lo)
     s    = fltflt_two_sum(p%hi, c%hi)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
     s    = fltflt_fast_two_sum(s%hi, s%lo)
-    s%lo = s%lo + c%lo
+    s%lo = __fadd_rn(s%lo, c%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_approx_ff_ff_ff
 
@@ -772,7 +810,7 @@ contains
     p%lo = __fmaf_rn(a%hi, b%lo, p%lo)
     p%lo = __fmaf_rn(a%lo, b%hi, p%lo)
     s    = fltflt_two_sum(p%hi, c)
-    s%lo = s%lo + p%lo
+    s%lo = __fadd_rn(s%lo, p%lo)
     r    = fltflt_fast_two_sum(s%hi, s%lo)
   end function fma_approx_ff_ff_r4
 
@@ -817,30 +855,31 @@ contains
   ! ================================================================
 
   ! fltflt_add3: 2 TwoSums + lo accumulation. ~19 flops vs 28 sequential.
-  pure attributes(device) function fltflt_add3(a, b, c) result(r)
+  attributes(device) function fltflt_add3(a, b, c) result(r)
     type(fltflt), intent(in) :: a, b, c
     type(fltflt) :: r, s1, s2
     real(4) :: lo
     s1 = fltflt_two_sum(a%hi, b%hi)
     s2 = fltflt_two_sum(s1%hi, c%hi)
-    lo = (a%lo + b%lo + c%lo) + (s1%lo + s2%lo)
+    lo = __fadd_rn(__fadd_rn(__fadd_rn(a%lo, b%lo), c%lo), __fadd_rn(s1%lo, s2%lo))
     r  = fltflt_fast_two_sum(s2%hi, lo)
   end function fltflt_add3
 
   ! fltflt_add4: balanced tree of 3 TwoSums. ~27 flops vs 42 sequential.
-  pure attributes(device) function fltflt_add4(a, b, c, d) result(r)
+  attributes(device) function fltflt_add4(a, b, c, d) result(r)
     type(fltflt), intent(in) :: a, b, c, d
     type(fltflt) :: r, s1, s2, s3
     real(4) :: lo
     s1 = fltflt_two_sum(a%hi, b%hi)
     s2 = fltflt_two_sum(c%hi, d%hi)
     s3 = fltflt_two_sum(s1%hi, s2%hi)
-    lo = ((a%lo + b%lo) + (c%lo + d%lo)) + (s1%lo + s2%lo + s3%lo)
+    lo = __fadd_rn(__fadd_rn(__fadd_rn(a%lo, b%lo), __fadd_rn(c%lo, d%lo)), &
+                   __fadd_rn(__fadd_rn(s1%lo, s2%lo), s3%lo))
     r  = fltflt_fast_two_sum(s3%hi, lo)
   end function fltflt_add4
 
   ! fltflt_add5: 4 TwoSums (balanced + 1). ~35 flops vs 56 sequential.
-  pure attributes(device) function fltflt_add5(a, b, c, d, e) result(r)
+  attributes(device) function fltflt_add5(a, b, c, d, e) result(r)
     type(fltflt), intent(in) :: a, b, c, d, e
     type(fltflt) :: r, s1, s2, s3, s4
     real(4) :: lo
@@ -848,7 +887,8 @@ contains
     s2 = fltflt_two_sum(c%hi, d%hi)
     s3 = fltflt_two_sum(s1%hi, s2%hi)
     s4 = fltflt_two_sum(s3%hi, e%hi)
-    lo = ((a%lo + b%lo) + (c%lo + d%lo) + e%lo) + (s1%lo + s2%lo + s3%lo + s4%lo)
+    lo = __fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(a%lo, b%lo), __fadd_rn(c%lo, d%lo)), e%lo), &
+                   __fadd_rn(__fadd_rn(__fadd_rn(s1%lo, s2%lo), s3%lo), s4%lo))
     r  = fltflt_fast_two_sum(s4%hi, lo)
   end function fltflt_add5
 
@@ -861,21 +901,15 @@ contains
     type(fltflt), intent(in) :: a
     type(fltflt) :: c, p
     p    = fltflt_two_prod_fma(a%hi, a%hi)
-    p%lo = __fmaf_rn(a%hi + a%hi, a%lo, p%lo)
+    p%lo = __fmaf_rn(__fadd_rn(a%hi, a%hi), a%lo, p%lo)
     c    = fltflt_fast_two_sum(p%hi, p%lo)
   end function fltflt_square
 
-  ! fltflt_recip: 1/a with numerator {1,0} inlined; saves 1 add vs div_ff_ff.
+  ! fltflt_recip: 1/a, the division algorithm with numerator 1 (a/0 = 0).
   attributes(device) function fltflt_recip(a) result(c)
     type(fltflt), intent(in) :: a
-    type(fltflt) :: c, p
-    real(4) :: q1, q2, s, e
-    q1 = 1.0 / a%hi
-    p  = fltflt_two_prod_fma(q1, a%hi)
-    s  = 1.0 - p%hi
-    e  = __fmaf_rn(-q1, a%lo, s - p%lo)
-    q2 = e / a%hi
-    c  = fltflt_fast_two_sum(q1, q2)
+    type(fltflt) :: c
+    c = div_r4_ff(1.0, a)
   end function fltflt_recip
 
   ! ================================================================
@@ -894,7 +928,7 @@ contains
     p1 = fltflt_two_prod_fma(a, b)
     p2 = fltflt_two_prod_fma(c, d)
     s  = fltflt_two_sum(p1%hi, p2%hi)
-    r  = fltflt_fast_two_sum(s%hi, s%lo + p1%lo + p2%lo)
+    r  = fltflt_fast_two_sum(s%hi, __fadd_rn(__fadd_rn(s%lo, p1%lo), p2%lo))
   end function dot2_r4
 
   ! dot2_r8: real(8) inputs — each converted to fltflt, then delegates to dot2_ff.
@@ -916,7 +950,7 @@ contains
     p2%lo = __fmaf_rn(c%hi, d%lo, p2%lo)
     p2%lo = __fmaf_rn(c%lo, d%hi, p2%lo)
     s     = fltflt_two_sum(p1%hi, p2%hi)
-    r     = fltflt_fast_two_sum(s%hi, s%lo + p1%lo + p2%lo)
+    r     = fltflt_fast_two_sum(s%hi, __fadd_rn(__fadd_rn(s%lo, p1%lo), p2%lo))
   end function dot2_ff
 
   ! ---- dot3: a*b + c*d + e*f ----
@@ -931,7 +965,7 @@ contains
     p3 = fltflt_two_prod_fma(e, f)
     s1 = fltflt_two_sum(p1%hi, p2%hi)
     s2 = fltflt_two_sum(s1%hi, p3%hi)
-    lo = (s1%lo + s2%lo) + (p1%lo + p2%lo + p3%lo)
+    lo = __fadd_rn(__fadd_rn(s1%lo, s2%lo), __fadd_rn(__fadd_rn(p1%lo, p2%lo), p3%lo))
     r  = fltflt_fast_two_sum(s2%hi, lo)
   end function dot3_r4
 
@@ -959,7 +993,7 @@ contains
     p3%lo = __fmaf_rn(e%lo, f%hi, p3%lo)
     s1    = fltflt_two_sum(p1%hi, p2%hi)
     s2    = fltflt_two_sum(s1%hi, p3%hi)
-    lo    = (s1%lo + s2%lo) + (p1%lo + p2%lo + p3%lo)
+    lo    = __fadd_rn(__fadd_rn(s1%lo, s2%lo), __fadd_rn(__fadd_rn(p1%lo, p2%lo), p3%lo))
     r     = fltflt_fast_two_sum(s2%hi, lo)
   end function dot3_ff
 
@@ -977,7 +1011,8 @@ contains
     s1 = fltflt_two_sum(p1%hi, p2%hi)
     s2 = fltflt_two_sum(s1%hi, p3%hi)
     s3 = fltflt_two_sum(s2%hi, p4%hi)
-    lo = ((s1%lo + s2%lo) + s3%lo) + (p1%lo + p2%lo + p3%lo + p4%lo)
+    lo = __fadd_rn(__fadd_rn(__fadd_rn(s1%lo, s2%lo), s3%lo), &
+               __fadd_rn(__fadd_rn(__fadd_rn(p1%lo, p2%lo), p3%lo), p4%lo))
     r  = fltflt_fast_two_sum(s3%hi, lo)
   end function dot4_r4
 
@@ -1009,7 +1044,8 @@ contains
     s1    = fltflt_two_sum(p1%hi, p2%hi)
     s2    = fltflt_two_sum(s1%hi, p3%hi)
     s3    = fltflt_two_sum(s2%hi, p4%hi)
-    lo    = ((s1%lo + s2%lo) + s3%lo) + (p1%lo + p2%lo + p3%lo + p4%lo)
+    lo    = __fadd_rn(__fadd_rn(__fadd_rn(s1%lo, s2%lo), s3%lo), &
+               __fadd_rn(__fadd_rn(__fadd_rn(p1%lo, p2%lo), p3%lo), p4%lo))
     r     = fltflt_fast_two_sum(s3%hi, lo)
   end function dot4_ff
 
@@ -1017,62 +1053,52 @@ contains
   ! Absolute value
   ! ================================================================
 
-  ! fltflt_abs: branchless; multiplies both components by sign(hi). 2 flops.
-  ! Assumes normalized input (sign(value) == sign(hi)).
+  ! fltflt_abs: negate both components iff hi < 0 (fltflt.h semantics;
+  ! predicated select, no branch). Assumes normalized input (sign(value) ==
+  ! sign(hi)); -0.0 is returned unchanged.
   pure attributes(device) function fltflt_abs(a) result(c)
     type(fltflt), intent(in) :: a
     type(fltflt) :: c
-    real(4) :: s
-    s    = sign(1.0, a%hi)
-    c%hi = a%hi * s
-    c%lo = a%lo * s
+    c%hi = merge(-a%hi, a%hi, a%hi < 0.0)
+    c%lo = merge(-a%lo, a%lo, a%hi < 0.0)
   end function fltflt_abs
 
   ! ================================================================
-  ! Square root
+  ! Square root (fltflt.h algorithms)
+  ! xn = rsqrt(a%hi) (MUFU.RSQ, <= 2 ulp, as rsqrtf in fltflt.h), yn = a%hi*xn
+  ! fltflt_sqrt:      Karp (Thall 2006, Alg. 7): full fltflt residual a - yn^2
+  ! fltflt_sqrt_fast: residual a%hi - yn^2 by one FMA, + a%lo (~1/5 the cost,
+  !                   ~45 bits instead of ~48 for some inputs)
+  ! sqrt(0) = 0 (xn is forced to 0), sqrt(x < 0) = NaN.
   ! ================================================================
 
-  ! fltflt_sqrt: one Newton step after real(4) sqrt. ~9 flops + 1 FMA.
-  ! q1 = sqrt(a%hi)              initial approximation
-  ! (p%hi, p%lo) = TwoProdFMA(q1, q1)  exact q1^2
-  ! s = a - q1^2                 residual in extended precision
-  ! q2 = s / (2*q1)              Newton correction
   attributes(device) function fltflt_sqrt(a) result(c)
     type(fltflt), intent(in) :: a
-    type(fltflt) :: c, p
-    real(4) :: q1, s, q2
-    if (a%hi == 0.0) then
-      c%hi = 0.0;  c%lo = 0.0;  return
-    end if
-    q1 = sqrt(a%hi)
-    p  = fltflt_two_prod_fma(q1, q1)
-    s  = (a%hi - p%hi - p%lo) + a%lo
-    q2 = s / (q1 + q1)
-    c  = fltflt_fast_two_sum(q1, q2)
+    type(fltflt) :: c, ynsqr, diff, prod
+    real(4) :: xn, yn
+    xn    = 0.0
+    if (a%hi /= 0.0) xn = rsqrt(a%hi)
+    yn    = __fmul_rn(a%hi, xn)
+    ynsqr = fltflt_two_prod_fma(yn, yn)
+    diff  = sub_ff_ff(a, ynsqr)
+    prod  = fltflt_two_prod_fma(xn, 0.5 * diff%hi)
+    c     = add_ff_r4(prod, yn)
   end function fltflt_sqrt
 
-  ! fltflt_sqrt_fast: ~7 flops via rsqrt initial estimate.
-  ! Slightly less precise than fltflt_sqrt (~45 bits vs ~48 bits)
-  ! but ~5x faster on throughput-bound kernels.
-  ! The -fast flag maps 1.0/sqrt(x) to hardware rsqrtf instruction.
   attributes(device) function fltflt_sqrt_fast(a) result(c)
     type(fltflt), intent(in) :: a
     type(fltflt) :: c
     real(4) :: xn, yn, residual, correction
-    if (a%hi == 0.0) then
-      c%hi = 0.0
-      c%lo = 0.0
-      return
-    end if
-    xn         = 1.0 / sqrt(a%hi)        ! rsqrt approx: -fast maps to rsqrtf
-    yn         = a%hi * xn               ! approximate sqrt
-    residual   = __fmaf_rn(-yn, yn, a%hi) + a%lo  ! a - yn^2 in extended precision
-    correction = (xn * 0.5) * residual   ! Newton correction term
+    xn         = 0.0
+    if (a%hi /= 0.0) xn = rsqrt(a%hi)
+    yn         = __fmul_rn(a%hi, xn)
+    residual   = __fadd_rn(__fmaf_rn(-yn, yn, a%hi), a%lo)
+    correction = __fmul_rn(__fmul_rn(xn, 0.5), residual)
     c          = fltflt_fast_two_sum(yn, correction)
   end function fltflt_sqrt_fast
 
   ! ================================================================
-  ! fltflt_norm3d: sqrt(dx^2 + dy^2 + dz^2)
+  ! fltflt_norm3d: sqrt(dx^2 + dy^2 + dz^2) (fltflt.h)
   !
   ! Three exact squares accumulated with one normalization, then
   ! fltflt_sqrt_fast. Cross-terms (2*hi*lo) from each square are
@@ -1088,10 +1114,13 @@ contains
     pz  = fltflt_two_prod_fma(dz%hi, dz%hi)
     s   = fltflt_two_sum(px%hi, py%hi)
     t   = fltflt_two_sum(s%hi, pz%hi)
-    lo  = (t%lo + s%lo) + (px%lo + py%lo + pz%lo)
-    lo  = __fmaf_rn(dx%hi + dx%hi, dx%lo, lo)
-    lo  = __fmaf_rn(dy%hi + dy%hi, dy%lo, lo)
-    lo  = __fmaf_rn(dz%hi + dz%hi, dz%lo, lo)
+    lo  = __fadd_rn(t%lo, s%lo)
+    lo  = __fadd_rn(lo, px%lo)
+    lo  = __fadd_rn(lo, py%lo)
+    lo  = __fadd_rn(lo, pz%lo)
+    lo  = __fmaf_rn(__fadd_rn(dx%hi, dx%hi), dx%lo, lo)
+    lo  = __fmaf_rn(__fadd_rn(dy%hi, dy%hi), dy%lo, lo)
+    lo  = __fmaf_rn(__fadd_rn(dz%hi, dz%hi), dz%lo, lo)
     sum_sq = fltflt_fast_two_sum(t%hi, lo)
     c   = fltflt_sqrt_fast(sum_sq)
   end function fltflt_norm3d
@@ -1103,7 +1132,7 @@ contains
   ! ================================================================
 
   ! fltflt_round_toward_zero: largest-magnitude integer with |result| <= |a|.
-  pure attributes(device) function fltflt_round_toward_zero(a) result(c)
+  attributes(device) function fltflt_round_toward_zero(a) result(c)
     type(fltflt), intent(in) :: a
     type(fltflt) :: c
     real(4) :: hi_trunc, lo_trunc
@@ -1130,13 +1159,24 @@ contains
     end if
   end function fltflt_round_toward_zero
 
+  ! floorf: floor of a real(4) as a real(4). The intrinsic floor() returns a
+  ! default (32-bit) integer and overflows once |x| >= 2^31 -- which lo does
+  ! for |hi| >= ~2^56. aint() is exact at any magnitude (|x| >= 2^23 is an
+  ! integer already).
+  pure attributes(device) function floorf(x) result(f)
+    real(4), intent(in) :: x
+    real(4) :: f
+    f = aint(x)
+    if (f > x) f = f - 1.0
+  end function floorf
+
   ! fltflt_floor: largest integer not greater than a.
-  pure attributes(device) function fltflt_floor(a) result(c)
+  attributes(device) function fltflt_floor(a) result(c)
     type(fltflt), intent(in) :: a
     type(fltflt) :: c
     real(4) :: hi_floor
     if (abs(a%hi) < 8388608.0) then  ! 2^23
-      hi_floor = real(floor(a%hi), 4)
+      hi_floor = floorf(a%hi)
       if (hi_floor == a%hi .and. a%lo < 0.0) then
         c%hi = a%hi - 1.0
         c%lo = 0.0
@@ -1145,12 +1185,12 @@ contains
         c%lo = 0.0
       end if
     else  ! a%hi is already an integer; refine with lo
-      c = fltflt_fast_two_sum(a%hi, real(floor(a%lo), 4))
+      c = fltflt_fast_two_sum(a%hi, floorf(a%lo))
     end if
   end function fltflt_floor
 
   ! fltflt_round_to_nearest: round to nearest integer, ties to even.
-  pure attributes(device) function fltflt_round_to_nearest(a) result(c)
+  attributes(device) function fltflt_round_to_nearest(a) result(c)
     type(fltflt), intent(in) :: a
     type(fltflt) :: c
     real(4) :: candidate, err, r_lo, frac
@@ -1182,7 +1222,11 @@ contains
       if (abs(frac) > 0.5) then
         r_lo = r_lo + sign(1.0, frac)
       else if (abs(frac) == 0.5) then
-        if (mod(a%hi + r_lo, 2.0) /= 0.0) then
+        ! hi + r_lo is odd iff exactly one of them is odd. Their FP32 sum
+        ! cannot be used: it is rounded once |hi| >= 2^24 and loses the bit.
+        ! Integer flags, not .neqv. of logicals (nvfortran device logicals,
+        ! see the .not. note in CLAUDE.md).
+        if (merge(1, 0, mod(a%hi, 2.0) /= 0.0) /= merge(1, 0, mod(r_lo, 2.0) /= 0.0)) then
           r_lo = r_lo + sign(1.0, frac)
         end if
       end if
@@ -1199,26 +1243,28 @@ contains
   attributes(device) function fmod_ff_ff(a_in, b_in) result(c)
     type(fltflt), intent(in) :: a_in, b_in
     type(fltflt) :: c
-    type(fltflt) :: a_abs, b_abs, q, trunc_q, neg_tq, rem
+    type(fltflt) :: a, b, q, trunc_q, rem
     real(4) :: sgn
     if (b_in%hi == 0.0 .and. b_in%lo == 0.0) then
-      c%hi = b_in%hi / b_in%hi  ! NaN via hardware (runtime 0/0, not a folded literal constant)
+      c%hi = ff_qnan
       c%lo = c%hi
       return
     end if
-    sgn   = sign(1.0, a_in%hi)
-    a_abs = fltflt_abs(a_in)
-    b_abs = fltflt_abs(b_in)
-    q       = div_ff_ff(a_abs, b_abs)
+    sgn = 1.0
+    a   = a_in
+    if (lt_ff_r4(a, 0.0)) then
+      sgn = -1.0
+      a   = neg_ff(a)
+    end if
+    b       = fltflt_abs(b_in)
+    q       = div_ff_ff(a, b)
     trunc_q = fltflt_round_toward_zero(q)
-    neg_tq%hi = -trunc_q%hi
-    neg_tq%lo = -trunc_q%lo
-    rem = fma_ff_ff_ff(neg_tq, b_abs, a_abs)  ! a_abs - trunc_q * b_abs
-    do while (rem >= b_abs)
-      rem = sub_ff_ff(rem, b_abs)
+    rem     = neg_ff(fma_ff_ff_ff(trunc_q, b, neg_ff(a)))  ! a - trunc_q*b
+    do while (ge_ff_ff(rem, b))
+      rem = sub_ff_ff(rem, b)
     end do
     do while (lt_ff_r4(rem, 0.0))
-      rem = add_ff_ff(rem, b_abs)
+      rem = add_ff_ff(rem, b)
     end do
     c%hi = sgn * rem%hi
     c%lo = sgn * rem%lo
@@ -1229,31 +1275,33 @@ contains
     type(fltflt), intent(in) :: a_in
     real(4),      intent(in) :: b_in
     type(fltflt) :: c
-    type(fltflt) :: a_abs, b_abs, q, trunc_q, neg_tq, rem
-    real(4) :: sgn, b_pos
+    type(fltflt) :: a, q, trunc_q, rem
+    real(4) :: sgn, b
     if (b_in == 0.0) then
-      c%hi = b_in / b_in  ! NaN via hardware (runtime 0/0, not a folded literal constant)
+      c%hi = ff_qnan
       c%lo = c%hi
       return
     end if
-    sgn   = sign(1.0, a_in%hi)
-    a_abs = fltflt_abs(a_in)
-    b_pos = abs(b_in)
-    b_abs = init_from_r4(b_pos)
-    q       = div_ff_r4(a_abs, b_pos)
+    sgn = 1.0
+    a   = a_in
+    if (lt_ff_r4(a, 0.0)) then
+      sgn = -1.0
+      a   = neg_ff(a)
+    end if
+    b       = abs(b_in)
+    q       = div_ff_r4(a, b)
     trunc_q = fltflt_round_toward_zero(q)
-    neg_tq%hi = -trunc_q%hi
-    neg_tq%lo = -trunc_q%lo
-    rem = fma_ff_r4_ff(neg_tq, b_pos, a_abs)  ! a_abs - trunc_q * b_pos
-    do while (rem >= b_abs)
-      rem = sub_ff_ff(rem, b_abs)
+    rem     = neg_ff(fma_ff_r4_ff(trunc_q, b, neg_ff(a)))  ! a - trunc_q*b
+    do while (ge_ff_r4(rem, b))
+      rem = sub_ff_r4(rem, b)
     end do
     do while (lt_ff_r4(rem, 0.0))
-      rem = add_ff_ff(rem, b_abs)
+      rem = add_ff_r4(rem, b)
     end do
     c%hi = sgn * rem%hi
     c%lo = sgn * rem%lo
   end function fmod_ff_r4
+
 
   ! ================================================================
   ! min / max / clamp
@@ -1315,7 +1363,7 @@ contains
   ! ================================================================
 
   ! fltflt_ceil: smallest integer not less than a. Uses identity ceil(x) = -floor(-x).
-  pure attributes(device) function fltflt_ceil(a) result(c)
+  attributes(device) function fltflt_ceil(a) result(c)
     type(fltflt), intent(in) :: a
     type(fltflt) :: c, neg
     neg%hi = -a%hi
@@ -1330,6 +1378,7 @@ contains
   ! ================================================================
 
   ! fltflt_hypot: sqrt(a^2 + b^2) for real(4) inputs. Uses exact dot2 for the sum of squares.
+  ! No scaling: the squares overflow FP32 for max(|a|,|b|) > ~1.8e19.
   attributes(device) function fltflt_hypot(a, b) result(c)
     real(4), intent(in) :: a, b
     type(fltflt) :: c
@@ -1354,19 +1403,21 @@ contains
   ! integer power, sign, lerp, warp reduction
   ! ================================================================
 
-  ! fltflt_pow_int: a^n for non-negative integer n via square-and-multiply.
+  ! fltflt_pow_int: a^n via square-and-multiply; n < 0 gives 1/a^|n|.
+  ! Error grows like ~log2(|n|) roundings (a few units of 2^-44 for |n| <= 8).
   attributes(device) function fltflt_pow_int(a, n) result(r)
     type(fltflt), intent(in) :: a
     integer,      intent(in) :: n
     type(fltflt) :: r, base
     integer :: m
     r%hi = 1.0;  r%lo = 0.0
-    base = a;    m = n
+    base = a;    m = abs(n)
     do while (m > 0)
       if (mod(m, 2) == 1) r = r * base
       base = fltflt_square(base)
       m = m / 2
     end do
+    if (n < 0) r = fltflt_recip(r)
   end function fltflt_pow_int
 
   ! fltflt_sign: copysign — magnitude of a with sign of b.

@@ -9,3 +9,12 @@
 *.png
 *.cubin
 *.s
+test/ff_test
+test/ff_test_nofma
+test/ff_matx
+test/work/
+test/__pycache__/
+tutorial/*/tut_add
+tutorial/*/tut_sub
+tutorial/*/tut_mul
+tutorial/*/tut_div

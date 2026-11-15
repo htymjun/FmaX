@@ -24,6 +24,14 @@ FmaX features a complete, pure-Fortran translation of NVIDIA MatX's `fltflt.h` l
 *   **Double-Layered Precision Models:** Harness `float_float` (representing numbers as the sum of two FP32s) to run multi-precise simulations directly on GPU hardware.
 *   **Designed for Future GPU Architectures:** Modern and upcoming GPU architectures (such as NVIDIA Blackwell and beyond) continue to aggressively widen the throughput gap between lower-precision (FP32/Tensor Cores) and native double-precision (FP64) execution units. By using `float_float` arithmetic, FmaX allows you to emulate high-precision calculations while riding the performance wave of next-generation, high-throughput lower-precision silicon.
 
+## ✅ Verification
+
+`test/` checks `FmaX/fltflt.f90` on the GPU (`cd test && make test CASE_GPU_CC=<cc>`):
+
+*   **Bit-identical to NVIDIA MatX `fltflt.h`** for every operation both libraries provide, on 2^18 random inputs per operation (cancellation, wide exponent ranges, integers and ties included).
+*   **Independent of compiler FMA contraction**: built with and without `-Mnofma`, every result agrees bit for bit.
+*   **Accuracy** within 2^-44 relative of an extended-precision reference, canonical `(hi, lo)` form, exact rounding functions, and 63 hand-written edge cases.
+
 ## License
 
 This project is a CUDA Fortran translation of the C++ header `fltflt.h`
